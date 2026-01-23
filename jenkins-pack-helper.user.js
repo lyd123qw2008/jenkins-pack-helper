@@ -1,0 +1,1236 @@
+// ==UserScript==
+// @name         Jenkins Pack Helper
+// @namespace    jenkins-pack-helper
+// @version      0.1.0
+// @description  Build Jenkins jobs and extract success messages.
+// @match        http://192.169.2.50:9081/*
+// @grant        GM_setClipboard
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // Jenkins timestamper script calls querySelector on addedNodes, which can include text nodes.
+  // Provide a safe fallback to avoid console errors.
+  if (!Node.prototype.querySelector) {
+    Node.prototype.querySelector = function () { return null; };
+  }
+
+  const SCRIPT_VERSION = '2026-01-22-9';
+  const STORAGE_KEY = 'jph_config_v1';
+  const HISTORY_KEY = 'jph_history_v1';
+  const UI_KEY = 'jph_ui_v1';
+  const HISTORY_LIMIT = 30;
+  const DEFAULT_RULES = [
+      {
+        name: 'docker',
+        job_pattern: '^FXYF2_docker.*',
+        success_patterns: [
+          '.*?(镜像仓库：[^，,]+[，,]镜像版本：V[0-9.]+\\.[0-9]+[，,]已成功推送至：\\S+\\s*仓库项目中，自动化镜像构建脚本运行完成！)'
+        ],
+        result_template: '{match}'
+      },
+      {
+        name: 'doc',
+        job_pattern: '^FXYF2_doc.*',
+        success_patterns: [
+          '.*?([^\\r\\n]+?\\.zip已打包好[，,]?请到以下路径提取包进行测试。[^\\r\\n]*)'
+        ],
+        result_template: '{match}'
+      },
+      {
+        name: 'send_doc',
+        job_pattern: '^5gsend-Platform-.*_doc$',
+        success_patterns: [
+          '.*?([^\\r\\n]+?\\.zip\\s*已发送到珠海平台[^\\r\\n]*目录中，请知悉！)'
+        ],
+        result_template: '{match}'
+      },
+      {
+        name: 'send_docker',
+        job_pattern: '^5gsend-Platform-send-docker$',
+        success_patterns: [
+          '.*?([\\w./-]+:V[0-9.]+(?:\\.[0-9]+)?已发送到珠海平台:[^\\s]+目录中，请知悉！)'
+        ],
+        result_template: '{match}'
+      },
+      {
+        name: 'fallback',
+        job_pattern: '.*',
+        success_patterns: [
+          '.*?([^\\r\\n]+?\\.zip已打包好[，,]?请到以下路径提取包进行测试。[^\\r\\n]*)'
+        ],
+        result_template: '{match}'
+      }
+    ];
+  const DEFAULT_CONFIG = {
+    rules: JSON.parse(JSON.stringify(DEFAULT_RULES)),
+    debug: false
+  };
+
+  function loadConfig() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+      return JSON.parse(raw);
+    } catch (e) {
+      console.warn('Failed to load config, using default.', e);
+      return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+    }
+  }
+
+  function saveConfig(cfg) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+  }
+
+  function loadHistory() {
+    try {
+      const raw = localStorage.getItem(HISTORY_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) {
+      console.warn('Failed to load history.', e);
+      return [];
+    }
+  }
+
+  function saveHistory(list) {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+  }
+
+  function loadUI() {
+    try {
+      const raw = localStorage.getItem(UI_KEY);
+      if (!raw) return { visible: false };
+      const cfg = JSON.parse(raw);
+      return { visible: !!cfg.visible };
+    } catch (e) {
+      return { visible: false };
+    }
+  }
+
+  function saveUI(state) {
+    localStorage.setItem(UI_KEY, JSON.stringify(state));
+  }
+
+  function mergeHistory(current, incoming) {
+    const map = new Map();
+    (current || []).forEach(item => {
+      if (item && item.id) map.set(item.id, item);
+    });
+    (incoming || []).forEach(item => {
+      if (!item || !item.id) return;
+      const prev = map.get(item.id) || {};
+      map.set(item.id, { ...prev, ...item });
+    });
+    return Array.from(map.values());
+  }
+
+  function sortTrimHistory(list) {
+    return (list || [])
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+      .slice(0, HISTORY_LIMIT);
+  }
+
+  function el(tag, attrs, children) {
+    const node = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(k => {
+        if (k === 'class') node.className = attrs[k];
+        else if (k === 'html') node.innerHTML = attrs[k];
+        else node.setAttribute(k, attrs[k]);
+      });
+    }
+    if (children) children.forEach(c => node.appendChild(c));
+    return node;
+  }
+
+  function injectStyles() {
+    const style = el('style', { html: `
+      #jph-panel {
+        position: fixed; right: 16px; top: 90px; width: 360px;
+        background: #0f172a; color: #e2e8f0; z-index: 99999;
+        border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+        font-family: Segoe UI, Arial, sans-serif; overflow: hidden;
+      }
+      #jph-panel h3 { margin: 0; padding: 10px 12px; font-size: 14px; background: #111827; }
+      #jph-panel .body { padding: 10px 12px; }
+      #jph-panel .job { border: 1px solid #1f2937; border-radius: 8px; padding: 8px; margin-bottom: 8px; background:#0b1224; }
+      #jph-panel label { font-size: 12px; color: #cbd5e1; display:block; margin-top: 6px; }
+      #jph-panel input, #jph-panel textarea {
+        width: 100%; box-sizing: border-box; background: #0b1224;
+        color: #e2e8f0; border: 1px solid #1f2937; border-radius: 6px;
+        padding: 6px; font-size: 12px;
+      }
+      #jph-panel button {
+        background: #3b82f6; border: 0; color: #fff; padding: 6px 10px;
+        border-radius: 6px; cursor: pointer; margin-right: 6px; font-size: 12px;
+      }
+      #jph-panel button.secondary { background: #475569; }
+      #jph-panel .result { white-space: pre-wrap; background: #0b1224; border-radius: 6px; padding: 8px; min-height: 40px; font-size: 12px; }
+      #jph-panel .result-meta { margin: 4px 0 6px; color: #94a3b8; font-size: 11px; }
+      #jph-panel .logs { white-space: pre-wrap; color: #94a3b8; font-size: 11px; margin-top: 6px; }
+      #jph-panel details.logs-wrap > summary { cursor: pointer; }
+      #jph-toggle {
+        position: fixed; right: 16px; top: 50px; z-index: 99999;
+        background: #0f172a; color: #e2e8f0; border-radius: 6px;
+        padding: 6px 10px; cursor: pointer; font-size: 12px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+      }
+      #jph-panel .muted { color:#94a3b8; font-size: 11px; }
+      #jph-panel details > summary { cursor: pointer; }
+      #jph-panel .tabs { display:flex; gap:6px; margin:8px 0; }
+      #jph-panel .tab { padding:4px 8px; font-size:11px; border-radius:6px; background:#0b1224; cursor:pointer; border:1px solid #1f2937; }
+      #jph-panel .tab.active { background:#1d4ed8; border-color:#1d4ed8; color:#fff; }
+      #jph-panel .tab-help { margin-left: auto; font-size: 12px; color: #94a3b8; cursor: help; }
+      #jph-panel .tabs { align-items: center; }
+      .jph-menu-item-link { cursor:pointer; }
+      #jph-panel .history { max-height: 260px; overflow:auto; border:1px solid #1f2937; border-radius:8px; background:#0b1224; }
+      #jph-panel .history-item { padding:6px 8px; border-bottom:1px solid #111827; cursor:pointer; }
+      #jph-panel .history-item:last-child { border-bottom:0; }
+      #jph-panel .history-item:hover { background:#0f172a; }
+      #jph-panel .history-actions { margin-top:4px; display:flex; gap:6px; }
+      #jph-panel .history-actions button { background:#1f2937; color:#e2e8f0; border:1px solid #334155; padding:2px 6px; border-radius:6px; font-size:10px; }
+      #jph-panel .badge { display:inline-block; padding:2px 6px; border-radius:10px; font-size:10px; margin-left:6px; }
+      #jph-panel .badge.success { background:#16a34a; color:#fff; }
+      #jph-panel .badge.failure { background:#dc2626; color:#fff; }
+      #jph-panel .badge.aborted { background:#f59e0b; color:#111827; }
+      #jph-panel .badge.building { background:#0ea5e9; color:#fff; }
+      #jph-panel .badge.unknown { background:#475569; color:#fff; }
+      #jph-panel .history-meta { display:flex; gap:6px; flex-wrap:wrap; font-size:10px; color:#94a3b8; }
+      #jph-panel .history-title { font-size:12px; margin-bottom:2px; }
+      #jph-panel .row { display:flex; gap:6px; margin:6px 0; flex-wrap:wrap; }
+      #jph-panel .row button { flex:0 0 auto; }
+      #jph-filter-row { margin-top: 4px; }
+      #jph-filter { width: 100%; }
+      #jph-config-view { background:#0b1224; border:1px solid #1f2937; border-radius:6px; padding:8px; font-size:12px; overflow:auto; max-height:240px; }
+      #jph-config-view code { white-space: pre-wrap; display:block; }
+      #jph-config-tree { background:#0b1224; border:1px solid #1f2937; border-radius:6px; padding:8px; font-size:12px; max-height:240px; overflow:auto; }
+      #jph-config-tree details { margin: 4px 0; }
+      #jph-config-tree summary { cursor: pointer; }
+      #jph-config-tree .json-children { margin-left: 10px; padding-left: 8px; border-left: 1px dashed #1f2937; }
+      #jph-config-tree .json-key { color:#93c5fd; }
+      #jph-config-tree .json-string { color:#f9a8d4; }
+      #jph-config-tree .json-number { color:#fbbf24; }
+      #jph-config-tree .json-boolean { color:#86efac; }
+      #jph-config-tree .json-null { color:#94a3b8; }
+      #jph-config-tree .json-type { color:#94a3b8; margin-left:6px; }
+      #jph-panel .json-key { color:#93c5fd; }
+      #jph-panel .json-string { color:#f9a8d4; }
+      #jph-panel .json-number { color:#fbbf24; }
+      #jph-panel .json-boolean { color:#86efac; }
+      #jph-panel .json-null { color:#94a3b8; }
+    `});
+    document.head.appendChild(style);
+  }
+
+  function normalizeUrl(base, path) {
+    try {
+      return new URL(path, base).toString();
+    } catch (_) {
+      return base.replace(/\/+$/, '') + '/' + path.replace(/^\/+/, '');
+    }
+  }
+
+  async function fetchConsoleText(baseUrl, jobFullName, buildNumber) {
+    const path = buildJobPath(jobFullName);
+    const url = normalizeUrl(baseUrl, `${path}/${buildNumber}/console`);
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Failed to fetch console HTML');
+    const html = await resp.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const pre = doc.querySelector('pre') || doc.querySelector('#out') || doc.querySelector('.console-output');
+    if (pre) return pre.innerText;
+    return doc.body ? doc.body.innerText : '';
+  }
+
+  function copyToClipboard(text) {
+    if (typeof GM_setClipboard === 'function') {
+      GM_setClipboard(text);
+      return Promise.resolve();
+    }
+    if (navigator.clipboard) {
+      return navigator.clipboard.writeText(text);
+    }
+    return Promise.reject(new Error('Clipboard unavailable'));
+  }
+
+  function extractResult(text, patterns) {
+    const cleaned = text ? text.replace(/\x1B\[[0-9;]*m/g, '') : '';
+    let lines = null;
+    const getLines = () => {
+      if (!lines) lines = cleaned.replace(/\r/g, '\n').split(/\n/);
+      return lines;
+    };
+    const matches = [];
+    (patterns || []).forEach(p => {
+      const re = new RegExp(p, 'gm');
+      let m;
+      while ((m = re.exec(cleaned)) !== null) {
+        if (m.length > 1) {
+          matches.push(m[1] || m[0]);
+        } else {
+          matches.push(m[0]);
+        }
+      }
+    });
+    if (matches.length) {
+      const picked = matches[matches.length - 1].split(/\r?\n/)[0].trim();
+      if (picked.includes('镜像仓库：')) return picked;
+      if (picked.includes('ftp://')) return picked;
+      const linesLocal = getLines();
+      for (let i = linesLocal.length - 1; i >= 0; i--) {
+        const line = linesLocal[i].trim();
+        if (!line) continue;
+        if (line.includes(picked)) {
+          let out = line;
+          const next = (linesLocal[i + 1] || '').trim();
+          if (next.startsWith('ftp://')) out = out + '\n' + next;
+          return out;
+        }
+      }
+      return picked;
+    }
+
+    // Prefer exact line match for the pack message; take the last one.
+    const linesLocal = getLines();
+    let lastPackLine = '';
+    let lastPackIndex = -1;
+    for (let i = 0; i < linesLocal.length; i++) {
+      const line = linesLocal[i].trim();
+      if (!line) continue;
+      if (line.includes('已打包好') && line.includes('请到以下路径提取包进行测试')) {
+        lastPackLine = line;
+        lastPackIndex = i;
+      }
+    }
+    if (lastPackLine) {
+      if (lastPackLine.includes('ftp://')) return lastPackLine;
+      for (let j = lastPackIndex + 1; j < Math.min(linesLocal.length, lastPackIndex + 6); j++) {
+        const next = linesLocal[j].trim();
+        if (!next) continue;
+        if (next.includes('ftp://')) return lastPackLine + '\n' + next;
+        break;
+      }
+      return lastPackLine;
+    }
+
+    // Fallback for garbled encoding: match line containing .zip and ftp://
+    let lastZipFtp = '';
+    for (let i = 0; i < linesLocal.length; i++) {
+      const line = linesLocal[i].trim();
+      if (!line) continue;
+      if (line.includes('.zip') && line.includes('ftp://')) {
+        lastZipFtp = line;
+      }
+    }
+    if (lastZipFtp) return lastZipFtp;
+    let lastIndex = -1;
+    for (let i = 0; i < linesLocal.length; i++) {
+      const line = linesLocal[i].trim();
+      if (!line) continue;
+      if (line.includes('已打包好') && line.includes('请到以下路径提取包进行测试')) {
+        lastIndex = i;
+      }
+    }
+    if (lastIndex >= 0) {
+      const line = linesLocal[lastIndex].trim();
+      let out = line;
+      for (let j = lastIndex + 1; j < Math.min(linesLocal.length, lastIndex + 4); j++) {
+        const next = linesLocal[j].trim();
+        if (!next) continue;
+        if (next.includes('ftp://')) {
+          out = out + '\n' + next;
+        }
+        break;
+      }
+      return out;
+    }
+    return null;
+  }
+
+
+
+  function collectPackLines(text) {
+    const cleaned = text ? text.replace(/\x1B\[[0-9;]*m/g, '') : '';
+    const lines = cleaned.replace(/\r/g, '\n').split(/\n/);
+    const hits = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (line.includes('已打包好') || line.includes('请到以下路径提取包进行测试') || line.includes('ftp://') || (line.includes('.zip') && line.includes('ftp://'))) {
+        hits.push({ index: i + 1, line });
+      }
+    }
+    return hits;
+  }
+
+  function debugFirstMatch(text, pattern) {
+    const cleaned = text ? text.replace(/\x1B\[[0-9;]*m/g, '') : '';
+    try {
+      const re = new RegExp(pattern, 'gm');
+      const m = re.exec(cleaned);
+      if (!m) return { found: false };
+      return { found: true, length: m.length, m0: m[0], m1: m[1] };
+    } catch (e) {
+      return { found: false, error: e.message || String(e) };
+    }
+  }
+
+  function formatDuration(ms) {
+    if (!ms && ms !== 0) return '-';
+    const sec = Math.floor(ms / 1000);
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    if (m <= 0) return `${s}s`;
+    return `${m}m ${s}s`;
+  }
+
+  function formatTime(ts) {
+    if (!ts) return '-';
+    const d = new Date(ts);
+    return d.toLocaleString();
+  }
+
+  function statusClass(result, building) {
+    if (building) return 'building';
+    if (!result) return 'unknown';
+    const r = result.toLowerCase();
+    if (r === 'success') return 'success';
+    if (r === 'failure') return 'failure';
+    if (r === 'aborted') return 'aborted';
+    return 'unknown';
+  }
+
+  function buildHistoryId(jobName, buildNumber) {
+    return `${jobName}#${buildNumber}`;
+  }
+
+  function pickUserName(actions) {
+    if (!Array.isArray(actions)) return '';
+    for (const act of actions) {
+      if (!act || !Array.isArray(act.causes)) continue;
+      for (const c of act.causes) {
+        if (c.userName) return c.userName;
+        if (c.userId) return c.userId;
+      }
+    }
+    return '';
+  }
+
+  function resolveRule(jobName, cfg) {
+    const rules = cfg.rules || [];
+    let fallback = null;
+    for (const rule of rules) {
+      if (!rule) continue;
+      if (rule.job_pattern === '.*') {
+        fallback = rule;
+        continue;
+      }
+      if (jobName && rule.job_pattern) {
+        try {
+          const re = new RegExp(rule.job_pattern);
+          if (re.test(jobName)) return rule;
+        } catch (e) {
+          // ignore invalid regex
+        }
+      }
+    }
+    return fallback;
+  }
+
+  function isFolderJob(job) {
+    return String(job._class || '').includes('Folder');
+  }
+
+  function parseJobFullNameFromLink(link) {
+    try {
+      const url = new URL(link, location.origin);
+      const parts = url.pathname.split('/').filter(Boolean);
+      const names = [];
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (parts[i] === 'job') {
+          names.push(decodeURIComponent(parts[i + 1]));
+          i += 1;
+        }
+      }
+      return names.length ? names.join('/') : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function setMenuLabel(link, label) {
+    const labelEl = link.querySelector('.jenkins-menu__label, .menu-title, .title, span');
+    if (labelEl) {
+      labelEl.textContent = label;
+      return;
+    }
+    for (const node of Array.from(link.childNodes)) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        node.nodeValue = ' ' + label;
+        return;
+      }
+    }
+    link.appendChild(document.createTextNode(label));
+  }
+
+  async function copyBuildResult(jobFullName, buildNumber, cfg) {
+    const consoleText = await fetchConsoleText(location.origin, jobFullName, buildNumber);
+    const jobShortName = jobFullName.split('/').pop();
+    const rule = resolveRule(jobShortName, cfg);
+    const match = extractResult(consoleText, rule ? rule.success_patterns || [] : []);
+    if (!match) return null;
+    const output = rule ? (rule.result_template || '{match}').replace('{match}', match) : match;
+    await copyToClipboard(output);
+    return output;
+  }
+
+  async function fetchRecentJobsFromRss(baseUrl, limit) {
+    const url = normalizeUrl(baseUrl, '/rssAll');
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Failed to fetch RSS');
+    const xml = await resp.text();
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    const items = Array.from(doc.querySelectorAll('item'));
+    const results = [];
+    const seen = new Set();
+    for (const item of items) {
+      const link = item.querySelector('link')?.textContent?.trim();
+      let fullName = link ? parseJobFullNameFromLink(link) : null;
+      if (!fullName) {
+        const title = item.querySelector('title')?.textContent?.trim() || '';
+        const cleaned = title.replace(/\s*#\d+.*$/, '').replace(/\s*»\s*/g, '/').trim();
+        if (cleaned) fullName = cleaned;
+      }
+      if (!fullName || seen.has(fullName)) continue;
+      seen.add(fullName);
+      results.push(fullName);
+      if (results.length >= limit) break;
+    }
+    return results;
+  }
+
+  function isLoggedIn() {
+    const logoutLink = document.querySelector('a[href*="logout"], a[href*="/logout"]');
+    if (logoutLink) return true;
+    return false;
+  }
+
+  function getCurrentUserName() {
+    if (!isLoggedIn()) return '';
+    const userLink = document.querySelector('a[href*="/user/"], a[href*="user/"]');
+    if (userLink && userLink.textContent) return userLink.textContent.trim();
+    return '';
+  }
+
+  function buildJobPath(fullName) {
+    const parts = fullName.split('/').filter(Boolean).map(encodeURIComponent);
+    return `/job/${parts.join('/job/')}`;
+  }
+
+  async function fetchFolderJobs(baseUrl, folderFullName) {
+    const path = buildJobPath(folderFullName);
+    const api = normalizeUrl(baseUrl, `${path}/api/json?tree=jobs[name,_class,lastBuild[timestamp]]`);
+    const resp = await fetch(api, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Failed to fetch folder jobs');
+    const data = await resp.json();
+    return data.jobs || [];
+  }
+
+  async function fetchAllJobs(baseUrl) {
+    const api = normalizeUrl(baseUrl, `/api/json?tree=jobs[name,_class,lastBuild[timestamp]]`);
+    const resp = await fetch(api, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Failed to fetch jobs');
+    const data = await resp.json();
+    const roots = data.jobs || [];
+    const results = [];
+    const queue = roots.map(j => ({ job: j, parent: '' }));
+    while (queue.length) {
+      const { job, parent } = queue.shift();
+      if (!job || !job.name) continue;
+      const fullName = parent ? `${parent}/${job.name}` : job.name;
+      if (isFolderJob(job)) {
+        try {
+          const children = await fetchFolderJobs(baseUrl, fullName);
+          children.forEach(child => queue.push({ job: child, parent: fullName }));
+        } catch (e) {
+          // ignore folder fetch errors
+        }
+        continue;
+      }
+      results.push({
+        name: job.name,
+        fullName,
+        lastBuild: job.lastBuild || null
+      });
+    }
+    return results;
+  }
+
+  async function fetchJobBuilds(baseUrl, jobFullName, limit) {
+    const cap = Number.isFinite(limit) ? limit : 30;
+    const path = buildJobPath(jobFullName);
+    const api = normalizeUrl(baseUrl, `${path}/api/json?tree=builds[number,url,building,result,timestamp,duration,actions[causes[userId,userName]]]{0,${cap}}`);
+    const resp = await fetch(api, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error(`Failed to fetch builds for ${jobFullName}`);
+    const data = await resp.json();
+    const builds = data.builds || [];
+    return builds.map(b => ({
+      id: buildHistoryId(jobFullName, b.number),
+      jobName: jobFullName,
+      jobShortName: jobFullName.split('/').pop(),
+      buildNumber: b.number,
+      url: b.url,
+      building: !!b.building,
+      result: b.result || null,
+      timestamp: b.timestamp || 0,
+      duration: b.duration || 0,
+      userName: pickUserName(b.actions || [])
+    }));
+  }
+
+  async function fetchBuildStatus(baseUrl, jobFullName, buildNumber) {
+    const path = buildJobPath(jobFullName);
+    const api = normalizeUrl(baseUrl, `${path}/${buildNumber}/api/json?tree=building,result,timestamp,duration,actions[causes[userId,userName]]`);
+    const resp = await fetch(api, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Failed to fetch build status');
+    const data = await resp.json();
+    return {
+      id: buildHistoryId(jobFullName, buildNumber),
+      jobName: jobFullName,
+      jobShortName: jobFullName.split('/').pop(),
+      buildNumber,
+      building: !!data.building,
+      result: data.result || null,
+      timestamp: data.timestamp || 0,
+      duration: data.duration || 0,
+      userName: pickUserName(data.actions || [])
+    };
+  }
+
+  function renderUI(cfg) {
+    if (document.getElementById('jph-panel')) return;
+    const toggle = el('div', { id: 'jph-toggle' });
+    toggle.textContent = 'Jenkins Pack Helper';
+    document.body.appendChild(toggle);
+
+    const panel = el('div', { id: 'jph-panel' });
+    panel.innerHTML = `
+      <h3>Jenkins Pack Helper <span class="muted" style="float:right;">${SCRIPT_VERSION}</span></h3>
+      <div class="body">
+        <div class="row">
+          <button class="secondary" id="jph-copy">Copy</button>
+          <button class="secondary" id="jph-refresh">Refresh</button>
+          <button class="secondary" id="jph-clear">Clear History</button>
+        </div>
+        <div class="result-meta" id="jph-result-meta"></div>
+        <div class="result" id="jph-result"></div>
+        <details class="logs-wrap" id="jph-logs-wrap">
+          <summary class="muted">Logs</summary>
+          <div class="logs" id="jph-logs"></div>
+        </details>
+        <div class="tabs">
+          <div class="tab active" data-tab="all">All</div>
+          <div class="tab" data-tab="byjob">By Job</div>
+          <div class="tab-help" title="只显示最近的10个job">?</div>
+        </div>
+        <div class="row" id="jph-filter-row" style="display:none;">
+          <input id="jph-filter" placeholder="Filter jobs..." />
+        </div>
+        <div id="jph-history-all" class="history"></div>
+        <div id="jph-history-byjob" class="history" style="display:none;"></div>
+        <details style="margin-top:8px;">
+          <summary class="muted">Config (JSON)</summary>
+          <div class="row" style="margin-bottom:6px;">
+            <button class="secondary" id="jph-view-tree">Tree</button>
+            <button class="secondary" id="jph-view-code">Code</button>
+          </div>
+          <div id="jph-config-tree"></div>
+          <pre id="jph-config-view"><code id="jph-config-code"></code></pre>
+          <textarea id="jph-config" rows="10" style="display:none;"></textarea>
+          <div style="margin-top:6px;">
+            <button class="secondary" id="jph-edit">Edit</button>
+            <button class="secondary" id="jph-reset">Reset</button>
+            <button class="secondary" id="jph-save" style="display:none;">Save Config</button>
+            <button class="secondary" id="jph-cancel" style="display:none;">Cancel</button>
+          </div>
+          <div class="muted" id="jph-msg"></div>
+        </details>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    let visible = loadUI().visible;
+    panel.style.display = visible ? 'block' : 'none';
+    toggle.addEventListener('click', () => {
+      visible = !visible;
+      panel.style.display = visible ? 'block' : 'none';
+      saveUI({ visible });
+    });
+
+    function escapeHtml(str) {
+      return str.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    }
+
+    function renderJsonTree(value, key, depth) {
+      const isObject = value && typeof value === 'object';
+      if (isObject) {
+        const isArray = Array.isArray(value);
+        const entries = isArray ? value.map((v, i) => [i, v]) : Object.entries(value);
+        const details = el('details', {});
+        if (depth === 0) details.open = true;
+        const label = key !== undefined ? `<span class="json-key">${escapeHtml(String(key))}</span>: ` : '';
+        const typeLabel = isArray ? 'array' : 'object';
+        const summary = el('summary', { html: `${label}<span class="json-type">${typeLabel}(${entries.length})</span>` });
+        const children = el('div', { class: 'json-children' });
+        entries.forEach(([k, v]) => {
+          children.appendChild(renderJsonTree(v, k, depth + 1));
+        });
+        details.appendChild(summary);
+        details.appendChild(children);
+        return details;
+      }
+
+      let cls = 'json-null';
+      let display = 'null';
+      if (typeof value === 'string') {
+        cls = 'json-string';
+        display = `"${value}"`;
+      } else if (typeof value === 'number') {
+        cls = 'json-number';
+        display = String(value);
+      } else if (typeof value === 'boolean') {
+        cls = 'json-boolean';
+        display = String(value);
+      }
+      const line = el('div', { html: `<span class="json-key">${escapeHtml(String(key))}</span>: <span class="${cls}">${escapeHtml(display)}</span>` });
+      return line;
+    }
+
+    function highlightJson(json) {
+      const escaped = escapeHtml(json);
+      return escaped.replace(/("(\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)/g, match => {
+        let cls = 'json-number';
+        if (/^"/.test(match)) {
+          cls = /:$/.test(match) ? 'json-key' : 'json-string';
+        } else if (/true|false/.test(match)) {
+          cls = 'json-boolean';
+        } else if (/null/.test(match)) {
+          cls = 'json-null';
+        }
+        return `<span class="${cls}">${match}</span>`;
+      });
+    }
+
+    function updateConfigView(nextCfg) {
+      const json = JSON.stringify(nextCfg, null, 2);
+      panel.querySelector('#jph-config').value = json;
+      panel.querySelector('#jph-config-code').innerHTML = highlightJson(json);
+      const treeRoot = panel.querySelector('#jph-config-tree');
+      treeRoot.innerHTML = '';
+      treeRoot.appendChild(renderJsonTree(nextCfg, 'root', 0));
+    }
+
+    function setLogsVisible(isDebug) {
+      const logsWrap = panel.querySelector('#jph-logs-wrap');
+      if (!logsWrap) return;
+      logsWrap.style.display = isDebug ? 'block' : 'none';
+      if (!isDebug) {
+        logsWrap.open = false;
+        panel.querySelector('#jph-logs').textContent = '';
+      }
+    }
+
+    updateConfigView(cfg);
+    let configViewMode = 'tree';
+    const treeBtn = panel.querySelector('#jph-view-tree');
+    const codeBtn = panel.querySelector('#jph-view-code');
+    function setConfigViewMode(mode) {
+      configViewMode = mode;
+      panel.querySelector('#jph-config-tree').style.display = mode === 'tree' ? 'block' : 'none';
+      panel.querySelector('#jph-config-view').style.display = mode === 'code' ? 'block' : 'none';
+      treeBtn.style.opacity = mode === 'tree' ? '1' : '0.6';
+      codeBtn.style.opacity = mode === 'code' ? '1' : '0.6';
+    }
+    setConfigViewMode('tree');
+    setLogsVisible(!!cfg.debug);
+    let lastResult = '';
+    let history = loadHistory();
+
+    function renderHistoryLists() {
+      const allRoot = panel.querySelector('#jph-history-all');
+      const byJobRoot = panel.querySelector('#jph-history-byjob');
+      const filterValue = (panel.querySelector('#jph-filter')?.value || '').trim().toLowerCase();
+      const sorted = sortTrimHistory(history);
+      history = sorted;
+      saveHistory(history);
+
+      if (!sorted.length) {
+        allRoot.innerHTML = `<div class="muted" style="padding:8px;">No history.</div>`;
+      } else {
+        allRoot.innerHTML = '';
+        sorted.forEach(item => {
+          const badgeCls = statusClass(item.result, item.building);
+          const title = `${item.jobName} #${item.buildNumber}`;
+          const line = el('div', { class: 'history-item', 'data-id': item.id });
+          line.innerHTML = `
+            <div class="history-title">${title}<span class="badge ${badgeCls}">${item.building ? 'BUILDING' : (item.result || 'UNKNOWN')}</span></div>
+            <div class="history-meta">
+              <span>${formatTime(item.timestamp)}</span>
+              <span>duration: ${formatDuration(item.duration)}</span>
+              <span>${item.userName || '-'}</span>
+            </div>
+            <div class="history-actions">
+              <button data-action="copy-job" data-job="${item.jobName}">Copy Job</button>
+              <button data-action="open-job" data-job="${item.jobName}">Open Job</button>
+              <button data-action="open-console" data-job="${item.jobName}" data-build="${item.buildNumber}">Console</button>
+            </div>
+          `;
+          allRoot.appendChild(line);
+        });
+      }
+
+      byJobRoot.innerHTML = '';
+      const groups = new Map();
+      sorted.forEach(item => {
+        if (!groups.has(item.jobName)) groups.set(item.jobName, []);
+        groups.get(item.jobName).push(item);
+      });
+      Array.from(groups.keys()).sort().forEach(jobName => {
+        if (filterValue) {
+          const hay = jobName.toLowerCase();
+          if (!hay.includes(filterValue)) return;
+        }
+        const items = groups.get(jobName) || [];
+        const section = el('div', { class: 'job' });
+        const header = el('div', { class: 'history-title', html: `${jobName}` });
+        section.appendChild(header);
+        if (!items.length) {
+          section.appendChild(el('div', { class: 'muted', html: 'No history.' }));
+        } else {
+          items.forEach(item => {
+            const badgeCls = statusClass(item.result, item.building);
+            const line = el('div', { class: 'history-item', 'data-id': item.id });
+            line.innerHTML = `
+              <div class="history-title">#${item.buildNumber}<span class="badge ${badgeCls}">${item.building ? 'BUILDING' : (item.result || 'UNKNOWN')}</span></div>
+              <div class="history-meta">
+                <span>${formatTime(item.timestamp)}</span>
+                <span>duration: ${formatDuration(item.duration)}</span>
+                <span>${item.userName || '-'}</span>
+              </div>
+              <div class="history-actions">
+                <button data-action="copy-job" data-job="${item.jobName}">Copy Job</button>
+                <button data-action="open-job" data-job="${item.jobName}">Open Job</button>
+                <button data-action="open-console" data-job="${item.jobName}" data-build="${item.buildNumber}">Console</button>
+              </div>
+            `;
+            section.appendChild(line);
+          });
+        }
+        byJobRoot.appendChild(section);
+      });
+    }
+
+    function setupBuildHistoryMenu() {
+      const root = document.getElementById('buildHistory') || document.querySelector('.build-history');
+      if (!root) return;
+
+      const isMenuRoot = el => {
+        if (!el || !(el instanceof Element)) return false;
+        const cls = (el.className || '').toString();
+        if (el.getAttribute && el.getAttribute('role') === 'menu') return true;
+        return /menu|yuimenu|jenkins-menu/i.test(cls);
+      };
+
+      const injectMenuItem = menuRoot => {
+        if (!menuRoot) return;
+        if (menuRoot.closest('#buildHistory') && !isMenuRoot(menuRoot)) return;
+        const existing = menuRoot.querySelectorAll('.jph-menu-item');
+        existing.forEach(n => n.remove());
+        const consoleLink = menuRoot.querySelector('a[href*="/console"]') || menuRoot.querySelector('a[href*="console"]');
+        if (!consoleLink) return;
+        const href = consoleLink.getAttribute('href') || '';
+        const match = href.match(/\/(\d+)(?:\/|$)/);
+        if (!match) return;
+        const jobFullName = parseJobFullNameFromLink(href);
+        if (!jobFullName) return;
+        const buildNumber = match[1];
+
+        const templateItem = consoleLink.closest('li') || consoleLink.closest('div') || consoleLink.parentElement;
+        const newItem = templateItem ? templateItem.cloneNode(true) : document.createElement('li');
+        let newLink = newItem.querySelector('a');
+        if (!newLink) {
+          newLink = document.createElement('a');
+          newItem.appendChild(newLink);
+        }
+        newItem.classList.add('jph-menu-item');
+        newLink.classList.add('jph-menu-item-link');
+        newLink.setAttribute('href', '#');
+        newLink.dataset.jphLabel = '复制结果';
+        setMenuLabel(newLink, '复制结果');
+        newLink.addEventListener('click', async e => {
+          e.preventDefault();
+          e.stopPropagation();
+          const old = newLink.dataset.jphLabel || '复制结果';
+          setMenuLabel(newLink, '处理中...');
+          try {
+            const output = await copyBuildResult(jobFullName, buildNumber, cfg);
+            setMenuLabel(newLink, output ? '已复制' : '未匹配');
+          } catch (err) {
+            setMenuLabel(newLink, '失败');
+          } finally {
+            setTimeout(() => {
+              setMenuLabel(newLink, old);
+            }, 1200);
+          }
+        });
+        const listRoot = (menuRoot.tagName === 'UL' || menuRoot.tagName === 'OL') ? menuRoot : (menuRoot.querySelector('ul,ol') || menuRoot);
+        if (listRoot && listRoot.appendChild) {
+          const first = listRoot.firstElementChild;
+          if (first) {
+            listRoot.insertBefore(newItem, first);
+          } else {
+            listRoot.appendChild(newItem);
+          }
+        }
+      };
+
+      const scanNode = node => {
+        if (!(node instanceof Element)) return;
+        const candidates = [];
+        if (isMenuRoot(node)) candidates.push(node);
+        if (node.querySelectorAll) {
+          node.querySelectorAll('[role="menu"], .yuimenu, .jenkins-menu, .menu').forEach(el => candidates.push(el));
+        }
+        candidates.forEach(el => {
+          if (el.querySelector && el.querySelector('a[href*="/console"]')) {
+            injectMenuItem(el);
+          }
+        });
+      };
+
+      scanNode(document.body);
+      if (window.__jph_history_observer) {
+        window.__jph_history_observer.disconnect();
+      }
+      window.__jph_history_observer = new MutationObserver(muts => {
+        muts.forEach(m => {
+          m.addedNodes && m.addedNodes.forEach(n => scanNode(n));
+        });
+      });
+      window.__jph_history_observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    async function refreshHistory(force) {
+      if (!isLoggedIn()) {
+        if (cfg.debug) {
+          panel.querySelector('#jph-logs').textContent += 'Debug: skip refresh (not logged in)\n';
+          panel.querySelector('#jph-logs-wrap').open = true;
+        }
+        return;
+      }
+      const baseUrl = location.origin;
+      const results = [];
+      let recentJobs = [];
+      try {
+        recentJobs = await fetchRecentJobsFromRss(baseUrl, 10);
+      } catch (e) {
+        if (cfg.debug) {
+          panel.querySelector('#jph-logs').textContent += `Debug: rss error=${e.message || e}\n`;
+        }
+        // ignore
+      }
+      if (!recentJobs.length) {
+        try {
+          const jobs = await fetchAllJobs(baseUrl);
+          recentJobs = jobs
+            .map(j => ({ name: j.fullName || j.name, ts: (j.lastBuild && j.lastBuild.timestamp) || 0 }))
+            .sort((a, b) => b.ts - a.ts)
+            .slice(0, 10)
+            .map(j => j.name);
+        } catch (e) {
+          if (cfg.debug) {
+            panel.querySelector('#jph-logs').textContent += `Debug: api error=${e.message || e}\n`;
+          }
+          // ignore
+        }
+      }
+      for (const jobName of recentJobs) {
+        try {
+          const builds = await fetchJobBuilds(baseUrl, jobName, 3);
+          results.push(...builds);
+        } catch (e) {
+          if (cfg.debug) {
+            panel.querySelector('#jph-logs').textContent += `Debug: builds error ${jobName}=${e.message || e}\n`;
+          }
+          // ignore per-job errors
+        }
+      }
+      if (force && results.length) {
+        history = sortTrimHistory(results);
+      } else {
+        history = mergeHistory(history, results);
+      }
+      renderHistoryLists();
+      if (cfg.debug) {
+        panel.querySelector('#jph-logs').textContent += `Debug: refresh jobs=${recentJobs.length} builds=${results.length} force=${!!force}\n`;
+        panel.querySelector('#jph-logs-wrap').open = true;
+      }
+    }
+
+    async function refreshBuildingOnly() {
+      const baseUrl = location.origin;
+      const building = (history || []).filter(i => i.building);
+      if (!building.length) return;
+      for (const item of building) {
+        try {
+          const updated = await fetchBuildStatus(baseUrl, item.jobName, item.buildNumber);
+          history = mergeHistory(history, [updated]);
+        } catch (e) {
+          // ignore
+        }
+      }
+      renderHistoryLists();
+    }
+
+    async function handleHistoryClick(target) {
+      const itemId = target.getAttribute('data-id');
+      if (!itemId) return;
+      const item = (history || []).find(i => i.id === itemId);
+      if (!item) return;
+      const rule = resolveRule(item.jobShortName || item.jobName, cfg);
+      try {
+        const consoleText = await fetchConsoleText(location.origin, item.jobName, item.buildNumber);
+        let output = '';
+        const match = extractResult(consoleText, rule ? rule.success_patterns || [] : []);
+        if (match) {
+          output = rule ? (rule.result_template || '{match}').replace('{match}', match) : match;
+        }
+        if (cfg.debug) {
+          const hits = collectPackLines(consoleText);
+          const logs = panel.querySelector('#jph-logs');
+          logs.textContent += `Debug: console length=${consoleText.length}\n`;
+          logs.textContent += `Debug: rule=${rule ? JSON.stringify(rule) : 'null'}\n`;
+          logs.textContent += `Debug: raw match=${match || 'null'}\n`;
+          if (rule && rule.success_patterns && rule.success_patterns[0]) {
+            const dm = debugFirstMatch(consoleText, rule.success_patterns[0]);
+            if (dm.error) {
+              logs.textContent += `Debug: regex error=${dm.error}\n`;
+            } else if (!dm.found) {
+              logs.textContent += 'Debug: regex found=false\n';
+            } else {
+              logs.textContent += `Debug: regex m.length=${dm.length}\n`;
+              logs.textContent += `Debug: regex m0=${dm.m0}\n`;
+              logs.textContent += `Debug: regex m1=${dm.m1 || ''}\n`;
+            }
+          }
+          if (!hits.length) {
+            logs.textContent += 'Debug: no lines with pack keywords.\n';
+          } else {
+            logs.textContent += 'Debug: pack-related lines:\n';
+            hits.slice(0, 15).forEach(h => {
+              logs.textContent += `#${h.index} ${h.line}\n`;
+            });
+          }
+          panel.querySelector('#jph-logs-wrap').open = true;
+        }
+        if (!output) {
+          output = '提取失败，请查看consoleText。';
+          if (cfg.debug) {
+            panel.querySelector('#jph-logs-wrap').open = true;
+          }
+        }
+        item.resultText = output;
+        history = mergeHistory(history, [item]);
+        renderHistoryLists();
+        lastResult = output;
+        panel.querySelector('#jph-result-meta').textContent = `${item.jobName} #${item.buildNumber} ${item.result || (item.building ? 'BUILDING' : '')}`.trim();
+        panel.querySelector('#jph-result').textContent = output;
+        if (typeof GM_setClipboard === 'function') {
+          GM_setClipboard(output);
+        } else if (navigator.clipboard) {
+          navigator.clipboard.writeText(output).catch(() => {});
+        }
+      } catch (e) {
+        panel.querySelector('#jph-logs').textContent += 'Error: ' + e.message + '\n';
+      }
+    }
+
+    panel.querySelector('#jph-edit').addEventListener('click', () => {
+      panel.querySelector('#jph-config-view').style.display = 'none';
+      panel.querySelector('#jph-config-tree').style.display = 'none';
+      panel.querySelector('#jph-config').style.display = 'block';
+      panel.querySelector('#jph-edit').style.display = 'none';
+      panel.querySelector('#jph-reset').style.display = 'none';
+      panel.querySelector('#jph-save').style.display = 'inline-block';
+      panel.querySelector('#jph-cancel').style.display = 'inline-block';
+      panel.querySelector('#jph-msg').textContent = '';
+    });
+
+    panel.querySelector('#jph-cancel').addEventListener('click', () => {
+      setConfigViewMode(configViewMode);
+      panel.querySelector('#jph-config').style.display = 'none';
+      panel.querySelector('#jph-edit').style.display = 'inline-block';
+      panel.querySelector('#jph-reset').style.display = 'inline-block';
+      panel.querySelector('#jph-save').style.display = 'none';
+      panel.querySelector('#jph-cancel').style.display = 'none';
+      panel.querySelector('#jph-msg').textContent = '';
+    });
+
+    panel.querySelector('#jph-reset').addEventListener('click', () => {
+      const next = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+      saveConfig(next);
+      updateConfigView(next);
+      panel.querySelector('#jph-msg').textContent = 'Reset to default';
+      setConfigViewMode(configViewMode);
+      setLogsVisible(!!next.debug);
+      panel.querySelector('#jph-config').style.display = 'none';
+      panel.querySelector('#jph-edit').style.display = 'inline-block';
+      panel.querySelector('#jph-reset').style.display = 'inline-block';
+      panel.querySelector('#jph-save').style.display = 'none';
+      panel.querySelector('#jph-cancel').style.display = 'none';
+    });
+
+    panel.querySelector('#jph-save').addEventListener('click', () => {
+      try {
+        const next = JSON.parse(panel.querySelector('#jph-config').value);
+        saveConfig(next);
+        updateConfigView(next);
+        panel.querySelector('#jph-msg').textContent = 'Saved';
+        setConfigViewMode(configViewMode);
+        setLogsVisible(!!next.debug);
+        panel.querySelector('#jph-config').style.display = 'none';
+        panel.querySelector('#jph-edit').style.display = 'inline-block';
+        panel.querySelector('#jph-reset').style.display = 'inline-block';
+        panel.querySelector('#jph-save').style.display = 'none';
+        panel.querySelector('#jph-cancel').style.display = 'none';
+      } catch (e) {
+        panel.querySelector('#jph-msg').textContent = 'Invalid JSON';
+      }
+    });
+
+    panel.querySelector('#jph-copy').addEventListener('click', () => {
+      if (!lastResult) return;
+      if (typeof GM_setClipboard === 'function') {
+        GM_setClipboard(lastResult);
+      } else if (navigator.clipboard) {
+        navigator.clipboard.writeText(lastResult).catch(() => {});
+      }
+    });
+
+    panel.querySelector('#jph-refresh').addEventListener('click', () => {
+      refreshHistory(true);
+    });
+
+    panel.querySelector('#jph-clear').addEventListener('click', () => {
+      history = [];
+      saveHistory(history);
+      renderHistoryLists();
+    });
+
+    treeBtn.addEventListener('click', () => setConfigViewMode('tree'));
+    codeBtn.addEventListener('click', () => setConfigViewMode('code'));
+
+    function handleActionClick(e) {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn) return false;
+      const action = btn.getAttribute('data-action');
+      const jobName = btn.getAttribute('data-job');
+      const buildNumber = btn.getAttribute('data-build');
+      if (!jobName) return true;
+      if (action === 'copy-job') {
+        if (typeof GM_setClipboard === 'function') {
+          GM_setClipboard(jobName);
+        } else if (navigator.clipboard) {
+          navigator.clipboard.writeText(jobName).catch(() => {});
+        }
+      } else if (action === 'open-job') {
+        const url = normalizeUrl(location.origin, buildJobPath(jobName) + '/');
+        window.open(url, '_blank');
+      } else if (action === 'open-console' && buildNumber) {
+        const url = normalizeUrl(location.origin, buildJobPath(jobName) + `/${buildNumber}/console`);
+        window.open(url, '_blank');
+      }
+      return true;
+    }
+
+    panel.querySelector('#jph-history-all').addEventListener('click', e => {
+      if (handleActionClick(e)) return;
+      const el = e.target.closest('.history-item');
+      if (el) handleHistoryClick(el);
+    });
+    panel.querySelector('#jph-history-byjob').addEventListener('click', e => {
+      if (handleActionClick(e)) return;
+      const el = e.target.closest('.history-item');
+      if (el) handleHistoryClick(el);
+    });
+
+    panel.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        panel.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const target = tab.getAttribute('data-tab');
+        panel.querySelector('#jph-history-all').style.display = target === 'all' ? 'block' : 'none';
+        panel.querySelector('#jph-history-byjob').style.display = target === 'byjob' ? 'block' : 'none';
+        panel.querySelector('#jph-filter-row').style.display = target === 'byjob' ? 'flex' : 'none';
+      });
+    });
+
+    panel.querySelector('#jph-filter').addEventListener('input', () => {
+      renderHistoryLists();
+    });
+
+    renderHistoryLists();
+    const sessionKey = 'jph_auto_refreshed_v1';
+    const userKey = 'jph_user_sig_v1';
+    const loginKey = 'jph_logged_in_v1';
+    const currentUser = getCurrentUserName();
+    const lastUser = sessionStorage.getItem(userKey) || '';
+    const userChanged = currentUser && currentUser !== lastUser;
+    const loggedIn = isLoggedIn();
+    const lastLoggedIn = sessionStorage.getItem(loginKey) === '1';
+    if (userChanged || !sessionStorage.getItem(sessionKey)) {
+      refreshHistory(true);
+      sessionStorage.setItem(sessionKey, '1');
+    }
+    sessionStorage.setItem(userKey, currentUser);
+    sessionStorage.setItem(loginKey, loggedIn ? '1' : '0');
+    if (window.__jph_refresh_timer) {
+      clearInterval(window.__jph_refresh_timer);
+    }
+    if (cfg.auto_poll_building) {
+      window.__jph_refresh_timer = setInterval(refreshBuildingOnly, 15000);
+    }
+    if (window.__jph_user_observer) {
+      window.__jph_user_observer.disconnect();
+    }
+    const checkLoginOnce = () => {
+      const nowLoggedIn = isLoggedIn();
+      const prevLoggedIn = sessionStorage.getItem(loginKey) === '1';
+      const nowUser = getCurrentUserName();
+      const prevUser = sessionStorage.getItem(userKey) || '';
+      if (nowLoggedIn && (!prevLoggedIn || (nowUser && nowUser !== prevUser))) {
+        refreshHistory(true);
+      }
+      sessionStorage.setItem(loginKey, nowLoggedIn ? '1' : '0');
+      sessionStorage.setItem(userKey, nowUser);
+    };
+    const header = document.querySelector('#header') || document.body;
+    window.__jph_user_observer = new MutationObserver(() => checkLoginOnce());
+    window.__jph_user_observer.observe(header, { childList: true, subtree: true, characterData: true });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) checkLoginOnce();
+    });
+    setupBuildHistoryMenu();
+  }
+
+  function init() {
+    injectStyles();
+    const cfg = loadConfig();
+    renderUI(cfg);
+  }
+
+  init();
+})();

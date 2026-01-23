@@ -1,0 +1,32 @@
+{
+  "jenkins": {
+    "base_url": "http://192.169.2.50:9081",
+    "user": "your-username",
+    "api_token": "",
+    "password": "",
+    "verify_ssl": true,
+    "timeout_seconds": 30
+  },
+  "jobs": {
+    "docker": {
+      "job_name": "FXYF2_docker_5g-os-console",
+      "type": "docker",
+      "success_patterns": [
+        "基于镜像仓库：(\\S+，镜像版本：V[0-9.]+\\.[0-9]+)"
+      ],
+      "result_template": "{match}"
+    },
+    "doc": {
+      "job_name": "FXYF2_doc",
+      "type": "doc",
+      "parameters": {
+        "name": "",
+        "SVN": ""
+      },
+      "success_patterns": [
+        "\\S+\\.zip已打包好，请到以下路径提取包进行测试。.*"
+      ],
+      "result_template": "{match}"
+    }
+  }
+}
