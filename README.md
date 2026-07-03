@@ -68,7 +68,7 @@ python web_app.py
 - 页面右侧会出现 Jenkins Pack Helper 面板（默认折叠，记忆展开状态）
 - All 自动按 Jenkins 全局构建流拉取最新构建并按时间倒序展示，滚动到底部会继续加载更早记录，后续可手动 Refresh
 - 列表点击即可抓取 console 输出并按规则提取结果，同时自动复制
-- By Job 支持 job 名模糊筛选
+- By Job 支持按 job 名筛选并查询该 job 自己的 build 历史，可继续加载更早构建
 - Build History 下拉菜单增加「复制结果」
 - Config 支持 Tree/Code 查看与编辑
 

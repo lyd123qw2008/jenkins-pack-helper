@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jenkins Pack Helper
 // @namespace    jenkins-pack-helper
-// @version      0.1.1
+// @version      0.1.2
 // @description  Build Jenkins jobs and extract success messages.
 // @match        http://192.169.2.50:9081/*
 // @updateURL    https://raw.githubusercontent.com/lyd123qw2008/jenkins-pack-helper/main/jenkins-pack-helper.user.js
@@ -18,7 +18,7 @@
     Node.prototype.querySelector = function () { return null; };
   }
 
-  const SCRIPT_VERSION = '2026-07-03-2';
+  const SCRIPT_VERSION = '2026-07-03-3';
   const STORAGE_KEY = 'jph_config_v1';
   const HISTORY_KEY = 'jph_history_v1';
   const UI_KEY = 'jph_ui_v1';
@@ -235,6 +235,13 @@
       #jph-panel .history-actions button { background:#1f2937; color:#e2e8f0; border:1px solid #334155; padding:2px 6px; border-radius:6px; font-size:10px; }
       #jph-panel .history-more { padding:8px; text-align:center; color:#94a3b8; font-size:11px; cursor:pointer; }
       #jph-panel .history-more:hover { background:#0f172a; color:#cbd5e1; }
+      #jph-panel .byjob-head { padding:8px; border-bottom:1px solid #111827; background:#0b1224; }
+      #jph-panel .byjob-name { font-size:12px; margin-bottom:3px; word-break:break-all; }
+      #jph-panel .job-picker { max-height:150px; overflow:auto; border-bottom:1px solid #111827; background:#0b1224; }
+      #jph-panel .job-option { padding:6px 8px; border-bottom:1px solid #111827; cursor:pointer; font-size:11px; word-break:break-all; }
+      #jph-panel .job-option:last-child { border-bottom:0; }
+      #jph-panel .job-option:hover { background:#0f172a; }
+      #jph-panel .job-option.active { background:#1d4ed8; color:#fff; }
       #jph-panel .badge { display:inline-block; padding:2px 6px; border-radius:10px; font-size:10px; margin-left:6px; }
       #jph-panel .badge.success { background:#16a34a; color:#fff; }
       #jph-panel .badge.failure { background:#dc2626; color:#fff; }
@@ -944,7 +951,7 @@
         <div class="tabs">
           <div class="tab active" data-tab="all">All</div>
           <div class="tab" data-tab="byjob">By Job</div>
-          <div class="tab-help" title="All 显示全局最新构建；By Job 按当前历史分组">?</div>
+          <div class="tab-help" title="All 显示全局最新构建；By Job 查询选中 job 自己的构建历史">?</div>
         </div>
         <div class="row" id="jph-filter-row" style="display:none;">
           <input id="jph-filter" placeholder="Filter jobs..." />
@@ -1070,6 +1077,9 @@
     let history = loadHistory();
     let refreshSeq = 0;
     let allLoadSeq = 0;
+    let byJobSeq = 0;
+    let currentTab = 'all';
+    let byJobFilterTimer = null;
     let allTimelineState = {
       loading: false,
       nextDay: null,
@@ -1082,6 +1092,14 @@
       offsets: {},
       exhausted: {},
       nextIndex: 0
+    };
+    let byJobState = {
+      jobListLoaded: false,
+      jobListLoading: false,
+      jobList: [],
+      selectedJob: parseJobFullNameFromLink(location.href) || '',
+      buildsByJob: {},
+      message: ''
     };
 
     function resetAllTimelineState() {
@@ -1273,6 +1291,153 @@
       }
     }
 
+    function getByJobEntry(jobName) {
+      const key = jobName || '';
+      if (!byJobState.buildsByJob[key]) {
+        byJobState.buildsByJob[key] = {
+          items: [],
+          offset: 0,
+          loading: false,
+          exhausted: false,
+          message: ''
+        };
+      }
+      return byJobState.buildsByJob[key];
+    }
+
+    function mergeBuildItems(current, incoming) {
+      const map = new Map();
+      (current || []).forEach(item => {
+        if (item && item.id) map.set(item.id, item);
+      });
+      (incoming || []).forEach(item => {
+        if (!item || !item.id) return;
+        const prev = map.get(item.id) || {};
+        map.set(item.id, { ...prev, ...item });
+      });
+      return Array.from(map.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    }
+
+    function findBuildItemById(itemId) {
+      const existing = (history || []).find(i => i.id === itemId);
+      if (existing) return existing;
+      for (const entry of Object.values(byJobState.buildsByJob || {})) {
+        const found = (entry.items || []).find(i => i.id === itemId);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    function updateByJobItem(item) {
+      if (!item || !item.jobName) return;
+      const entry = byJobState.buildsByJob[item.jobName];
+      if (!entry) return;
+      entry.items = mergeBuildItems(entry.items, [item]);
+    }
+
+    function getDefaultByJobName() {
+      return byJobState.selectedJob
+        || parseJobFullNameFromLink(location.href)
+        || ((history || [])[0] && history[0].jobName)
+        || ((byJobState.jobList || [])[0] && byJobState.jobList[0].name)
+        || '';
+    }
+
+    async function ensureByJobList() {
+      if (byJobState.jobListLoaded || byJobState.jobListLoading || !isLoggedIn()) return;
+      byJobState.jobListLoading = true;
+      byJobState.message = '';
+      renderHistoryLists();
+      try {
+        const jobs = await fetchAllJobs(location.origin);
+        byJobState.jobList = jobs
+          .map(j => ({ name: j.fullName || j.name, ts: (j.lastBuild && j.lastBuild.timestamp) || 0 }))
+          .filter(j => j.name)
+          .sort((a, b) => b.ts - a.ts);
+        byJobState.jobListLoaded = true;
+        if (!byJobState.selectedJob) {
+          byJobState.selectedJob = getDefaultByJobName();
+        }
+      } catch (e) {
+        byJobState.message = `Job list failed: ${e.message || e}`;
+        if (cfg.debug) {
+          panel.querySelector('#jph-logs').textContent += `Debug: by-job list error=${e.message || e}\n`;
+          panel.querySelector('#jph-logs-wrap').open = true;
+        }
+      } finally {
+        byJobState.jobListLoading = false;
+        renderHistoryLists();
+      }
+
+      const selected = byJobState.selectedJob;
+      if (selected) {
+        const entry = getByJobEntry(selected);
+        if (!entry.items.length && !entry.loading) loadMoreByJobHistory(true);
+      }
+    }
+
+    async function loadMoreByJobHistory(reset) {
+      const selected = byJobState.selectedJob || getDefaultByJobName();
+      if (!selected || !isLoggedIn()) return;
+      byJobState.selectedJob = selected;
+      const entry = getByJobEntry(selected);
+      if (entry.loading || (entry.exhausted && !reset)) return;
+
+      const seq = ++byJobSeq;
+      if (reset) {
+        entry.items = [];
+        entry.offset = 0;
+        entry.exhausted = false;
+      }
+      entry.loading = true;
+      entry.message = '';
+      renderHistoryLists();
+      try {
+        const builds = await fetchJobBuildsRange(location.origin, selected, entry.offset, HISTORY_PAGE_SIZE);
+        if (seq !== byJobSeq || byJobState.selectedJob !== selected) return;
+        entry.items = mergeBuildItems(entry.items, builds);
+        entry.offset += builds.length;
+        if (builds.length < HISTORY_PAGE_SIZE) entry.exhausted = true;
+        if (!builds.length) entry.message = 'No builds found.';
+      } catch (e) {
+        if (seq === byJobSeq && byJobState.selectedJob === selected) {
+          entry.message = `Load failed: ${e.message || e}`;
+        }
+        if (cfg.debug) {
+          panel.querySelector('#jph-logs').textContent += `Debug: by-job builds error ${selected}=${e.message || e}\n`;
+          panel.querySelector('#jph-logs-wrap').open = true;
+        }
+      } finally {
+        entry.loading = false;
+        if (seq !== byJobSeq || byJobState.selectedJob !== selected) return;
+        renderHistoryLists();
+      }
+    }
+
+    function selectByJob(jobName) {
+      if (!jobName) return;
+      if (byJobState.selectedJob !== jobName) {
+        byJobSeq += 1;
+        byJobState.selectedJob = jobName;
+      }
+      const entry = getByJobEntry(jobName);
+      renderHistoryLists();
+      if (!entry.items.length && !entry.loading) loadMoreByJobHistory(true);
+    }
+
+    function activateByJob() {
+      const selected = getDefaultByJobName();
+      if (selected && !byJobState.selectedJob) {
+        byJobState.selectedJob = selected;
+      }
+      renderHistoryLists();
+      ensureByJobList();
+      if (byJobState.selectedJob) {
+        const entry = getByJobEntry(byJobState.selectedJob);
+        if (!entry.items.length && !entry.loading) loadMoreByJobHistory(true);
+      }
+    }
+
     function createHistoryActionButton(action, label, item) {
       const button = el('button', { text: label });
       button.dataset.action = action;
@@ -1313,6 +1478,73 @@
       return line;
     }
 
+    function renderByJobHistory(byJobRoot, filterValue) {
+      byJobRoot.innerHTML = '';
+      if (!byJobState.selectedJob) {
+        byJobState.selectedJob = getDefaultByJobName();
+      }
+      const selected = byJobState.selectedJob;
+      const entry = selected ? getByJobEntry(selected) : null;
+
+      const head = el('div', { class: 'byjob-head' });
+      head.appendChild(el('div', { class: 'byjob-name', text: selected || 'No job selected' }));
+      const statusText = byJobState.jobListLoading
+        ? 'Loading jobs...'
+        : (byJobState.message || `${byJobState.jobList.length} jobs loaded`);
+      head.appendChild(el('div', { class: 'muted', text: statusText }));
+      byJobRoot.appendChild(head);
+
+      const normalizedFilter = filterValue.toLowerCase();
+      const matchedJobs = (byJobState.jobList || [])
+        .filter(job => !normalizedFilter || job.name.toLowerCase().includes(normalizedFilter));
+      const pickerLimit = normalizedFilter ? 50 : 8;
+      const shouldShowPicker = byJobState.jobListLoading || byJobState.jobList.length || normalizedFilter;
+      if (shouldShowPicker) {
+        const picker = el('div', { class: 'job-picker' });
+        if (byJobState.jobListLoading) {
+          picker.appendChild(el('div', { class: 'muted', style: 'padding:8px;', text: 'Loading jobs...' }));
+        } else if (!matchedJobs.length) {
+          picker.appendChild(el('div', { class: 'muted', style: 'padding:8px;', text: 'No matching jobs.' }));
+        } else {
+          matchedJobs.slice(0, pickerLimit).forEach(job => {
+            const option = el('div', {
+              class: `job-option${job.name === selected ? ' active' : ''}`,
+              text: job.name
+            });
+            option.dataset.job = job.name;
+            if (job.ts) option.title = `Last build: ${formatTime(job.ts)}`;
+            picker.appendChild(option);
+          });
+        }
+        byJobRoot.appendChild(picker);
+      }
+
+      if (!selected) {
+        byJobRoot.appendChild(el('div', { class: 'muted', style: 'padding:8px;', text: 'No job selected.' }));
+        return;
+      }
+
+      if (entry.message) {
+        byJobRoot.appendChild(el('div', { class: 'muted', style: 'padding:8px;', text: entry.message }));
+      }
+      if (entry.items.length) {
+        entry.items.forEach(item => {
+          byJobRoot.appendChild(createHistoryLine(item, `#${item.buildNumber}`));
+        });
+      } else if (entry.loading) {
+        byJobRoot.appendChild(el('div', { class: 'muted', style: 'padding:8px;', text: 'Loading builds...' }));
+      } else {
+        byJobRoot.appendChild(el('div', { class: 'muted', style: 'padding:8px;', text: 'No builds loaded.' }));
+      }
+
+      const moreText = entry.loading
+        ? 'Loading builds...'
+        : (entry.exhausted ? 'No more builds' : 'Load more builds');
+      const more = el('div', { class: 'history-more', text: moreText });
+      more.dataset.role = 'byjob-more';
+      byJobRoot.appendChild(more);
+    }
+
     function renderHistoryLists() {
       const allRoot = panel.querySelector('#jph-history-all');
       const byJobRoot = panel.querySelector('#jph-history-byjob');
@@ -1334,30 +1566,7 @@
         : (allTimelineState.message || 'Scroll or click for more');
       allRoot.appendChild(el('div', { class: 'history-more', text: moreText }));
 
-      byJobRoot.innerHTML = '';
-      const groups = new Map();
-      sorted.forEach(item => {
-        if (!groups.has(item.jobName)) groups.set(item.jobName, []);
-        groups.get(item.jobName).push(item);
-      });
-      Array.from(groups.keys()).sort().forEach(jobName => {
-        if (filterValue) {
-          const hay = jobName.toLowerCase();
-          if (!hay.includes(filterValue)) return;
-        }
-        const items = groups.get(jobName) || [];
-        const section = el('div', { class: 'job' });
-        const header = el('div', { class: 'history-title', text: `${jobName}` });
-        section.appendChild(header);
-        if (!items.length) {
-          section.appendChild(el('div', { class: 'muted', text: 'No history.' }));
-        } else {
-          items.forEach(item => {
-            section.appendChild(createHistoryLine(item, `#${item.buildNumber}`));
-          });
-        }
-        byJobRoot.appendChild(section);
-      });
+      renderByJobHistory(byJobRoot, filterValue);
     }
 
     function setupBuildHistoryMenu() {
@@ -1533,12 +1742,22 @@
 
     async function refreshBuildingOnly() {
       const baseUrl = location.origin;
-      const building = (history || []).filter(i => i.building);
+      const buildingMap = new Map();
+      (history || []).forEach(item => {
+        if (item && item.building && item.id) buildingMap.set(item.id, item);
+      });
+      Object.values(byJobState.buildsByJob || {}).forEach(entry => {
+        (entry.items || []).forEach(item => {
+          if (item && item.building && item.id) buildingMap.set(item.id, item);
+        });
+      });
+      const building = Array.from(buildingMap.values());
       if (!building.length) return;
       for (const item of building) {
         try {
           const updated = await fetchBuildStatus(baseUrl, item.jobName, item.buildNumber);
           history = mergeHistory(history, [updated]);
+          updateByJobItem(updated);
         } catch (e) {
           // ignore
         }
@@ -1549,7 +1768,7 @@
     async function handleHistoryClick(target) {
       const itemId = target.getAttribute('data-id');
       if (!itemId) return;
-      const item = (history || []).find(i => i.id === itemId);
+      const item = findBuildItemById(itemId);
       if (!item) return;
       const rule = resolveRule(item.jobShortName || item.jobName, cfg);
       try {
@@ -1595,6 +1814,7 @@
         }
         item.resultText = output;
         history = mergeHistory(history, [item]);
+        updateByJobItem(item);
         renderHistoryLists();
         lastResult = output;
         panel.querySelector('#jph-result-meta').textContent = `${item.jobName} #${item.buildNumber} ${item.result || (item.building ? 'BUILDING' : '')}`.trim();
@@ -1672,13 +1892,20 @@
     });
 
     panel.querySelector('#jph-refresh').addEventListener('click', () => {
-      refreshHistory(true);
+      if (currentTab === 'byjob') {
+        ensureByJobList();
+        if (byJobState.selectedJob) loadMoreByJobHistory(true);
+      } else {
+        refreshHistory(true);
+      }
     });
 
     panel.querySelector('#jph-clear').addEventListener('click', () => {
       history = [];
       saveHistory(history);
       resetAllTimelineState();
+      byJobSeq += 1;
+      byJobState.buildsByJob = {};
       renderHistoryLists();
     });
 
@@ -1728,6 +1955,15 @@
     panel.querySelector('#jph-history-all').addEventListener('scroll', maybeLoadMoreAllHistory);
     panel.querySelector('#jph-history-byjob').addEventListener('click', e => {
       if (handleActionClick(e)) return;
+      const jobOption = e.target.closest('.job-option');
+      if (jobOption && jobOption.dataset.job) {
+        selectByJob(jobOption.dataset.job);
+        return;
+      }
+      if (e.target.closest('.history-more')) {
+        loadMoreByJobHistory(false);
+        return;
+      }
       const el = e.target.closest('.history-item');
       if (el) handleHistoryClick(el);
     });
@@ -1737,15 +1973,21 @@
         panel.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
         const target = tab.getAttribute('data-tab');
+        currentTab = target;
         panel.querySelector('#jph-history-all').style.display = target === 'all' ? 'block' : 'none';
         panel.querySelector('#jph-history-byjob').style.display = target === 'byjob' ? 'block' : 'none';
         panel.querySelector('#jph-filter-row').style.display = target === 'byjob' ? 'flex' : 'none';
         if (target === 'all') setTimeout(maybeLoadMoreAllHistory, 0);
+        if (target === 'byjob') activateByJob();
       });
     });
 
     panel.querySelector('#jph-filter').addEventListener('input', () => {
       renderHistoryLists();
+      if (currentTab === 'byjob' && !byJobState.jobListLoaded) {
+        if (byJobFilterTimer) clearTimeout(byJobFilterTimer);
+        byJobFilterTimer = setTimeout(() => ensureByJobList(), 300);
+      }
     });
 
     renderHistoryLists();
