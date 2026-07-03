@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Jenkins Pack Helper
 // @namespace    jenkins-pack-helper
-// @version      0.1.0
+// @version      0.1.1
 // @description  Build Jenkins jobs and extract success messages.
 // @match        http://192.169.2.50:9081/*
+// @updateURL    https://raw.githubusercontent.com/lyd123qw2008/jenkins-pack-helper/main/jenkins-pack-helper.user.js
+// @downloadURL  https://raw.githubusercontent.com/lyd123qw2008/jenkins-pack-helper/main/jenkins-pack-helper.user.js
 // @grant        GM_setClipboard
 // ==/UserScript==
 
@@ -16,11 +18,17 @@
     Node.prototype.querySelector = function () { return null; };
   }
 
-  const SCRIPT_VERSION = '2026-01-22-9';
+  const SCRIPT_VERSION = '2026-07-03-2';
   const STORAGE_KEY = 'jph_config_v1';
   const HISTORY_KEY = 'jph_history_v1';
   const UI_KEY = 'jph_ui_v1';
-  const HISTORY_LIMIT = 30;
+  const HISTORY_LIMIT = 500;
+  const HISTORY_PAGE_SIZE = 30;
+  const HISTORY_RESULT_TEXT_LIMIT = 2000;
+  const RECENT_JOB_LIMIT = 10;
+  const TIMELINE_DAY_MS = 24 * 60 * 60 * 1000;
+  const TIMELINE_DAYS_PER_LOAD = 3;
+  let crumbCache = null;
   const DEFAULT_RULES = [
       {
         name: 'docker',
@@ -96,7 +104,28 @@
   }
 
   function saveHistory(list) {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+    const compact = (list || []).map(item => {
+      if (!item || typeof item !== 'object') return item;
+      const copy = { ...item };
+      if (typeof copy.resultText === 'string' && copy.resultText.length > HISTORY_RESULT_TEXT_LIMIT) {
+        copy.resultText = `${copy.resultText.slice(0, HISTORY_RESULT_TEXT_LIMIT)}...`;
+      }
+      return copy;
+    });
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(compact));
+    } catch (e) {
+      try {
+        const minimal = compact.slice(0, 100).map(item => {
+          if (!item || typeof item !== 'object') return item;
+          const { resultText, ...rest } = item;
+          return rest;
+        });
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(minimal));
+      } catch (inner) {
+        console.warn('Failed to save history.', inner);
+      }
+    }
   }
 
   function loadUI() {
@@ -128,7 +157,13 @@
   }
 
   function sortTrimHistory(list) {
-    return (list || [])
+    const map = new Map();
+    (list || []).forEach(item => {
+      if (!item || !item.id) return;
+      const prev = map.get(item.id) || {};
+      map.set(item.id, { ...prev, ...item });
+    });
+    return Array.from(map.values())
       .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
       .slice(0, HISTORY_LIMIT);
   }
@@ -139,6 +174,7 @@
       Object.keys(attrs).forEach(k => {
         if (k === 'class') node.className = attrs[k];
         else if (k === 'html') node.innerHTML = attrs[k];
+        else if (k === 'text') node.textContent = attrs[k];
         else node.setAttribute(k, attrs[k]);
       });
     }
@@ -153,9 +189,12 @@
         background: #0f172a; color: #e2e8f0; z-index: 99999;
         border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
         font-family: Segoe UI, Arial, sans-serif; overflow: hidden;
+        max-height: calc(100vh - 110px); display: flex; flex-direction: column;
       }
+      #jph-panel.jph-config-open,
+      #jph-panel:has(#jph-config-wrap[open]) { width: min(520px, calc(100vw - 32px)); height: calc(100vh - 110px); }
       #jph-panel h3 { margin: 0; padding: 10px 12px; font-size: 14px; background: #111827; }
-      #jph-panel .body { padding: 10px 12px; }
+      #jph-panel .body { padding: 10px 12px; overflow: auto; flex: 1; min-height: 0; }
       #jph-panel .job { border: 1px solid #1f2937; border-radius: 8px; padding: 8px; margin-bottom: 8px; background:#0b1224; }
       #jph-panel label { font-size: 12px; color: #cbd5e1; display:block; margin-top: 6px; }
       #jph-panel input, #jph-panel textarea {
@@ -186,12 +225,16 @@
       #jph-panel .tab-help { margin-left: auto; font-size: 12px; color: #94a3b8; cursor: help; }
       #jph-panel .tabs { align-items: center; }
       .jph-menu-item-link { cursor:pointer; }
-      #jph-panel .history { max-height: 260px; overflow:auto; border:1px solid #1f2937; border-radius:8px; background:#0b1224; }
+      #jph-panel .history { max-height: min(52vh, 520px); overflow:auto; border:1px solid #1f2937; border-radius:8px; background:#0b1224; }
+      #jph-panel.jph-config-open .history,
+      #jph-panel:has(#jph-config-wrap[open]) .history { max-height: min(24vh, 220px); }
       #jph-panel .history-item { padding:6px 8px; border-bottom:1px solid #111827; cursor:pointer; }
       #jph-panel .history-item:last-child { border-bottom:0; }
       #jph-panel .history-item:hover { background:#0f172a; }
       #jph-panel .history-actions { margin-top:4px; display:flex; gap:6px; }
       #jph-panel .history-actions button { background:#1f2937; color:#e2e8f0; border:1px solid #334155; padding:2px 6px; border-radius:6px; font-size:10px; }
+      #jph-panel .history-more { padding:8px; text-align:center; color:#94a3b8; font-size:11px; cursor:pointer; }
+      #jph-panel .history-more:hover { background:#0f172a; color:#cbd5e1; }
       #jph-panel .badge { display:inline-block; padding:2px 6px; border-radius:10px; font-size:10px; margin-left:6px; }
       #jph-panel .badge.success { background:#16a34a; color:#fff; }
       #jph-panel .badge.failure { background:#dc2626; color:#fff; }
@@ -204,9 +247,17 @@
       #jph-panel .row button { flex:0 0 auto; }
       #jph-filter-row { margin-top: 4px; }
       #jph-filter { width: 100%; }
-      #jph-config-view { background:#0b1224; border:1px solid #1f2937; border-radius:6px; padding:8px; font-size:12px; overflow:auto; max-height:240px; }
+      #jph-config-wrap { margin-top:8px; }
+      #jph-config-view { background:#0b1224; border:1px solid #1f2937; border-radius:6px; padding:8px; font-size:12px; overflow:auto; max-height:min(56vh, 620px); }
       #jph-config-view code { white-space: pre-wrap; display:block; }
-      #jph-config-tree { background:#0b1224; border:1px solid #1f2937; border-radius:6px; padding:8px; font-size:12px; max-height:240px; overflow:auto; }
+      #jph-config-tree { background:#0b1224; border:1px solid #1f2937; border-radius:6px; padding:8px; font-size:12px; max-height:min(56vh, 620px); overflow:auto; }
+      #jph-panel.jph-config-open #jph-config-tree,
+      #jph-panel.jph-config-open #jph-config-view,
+      #jph-panel.jph-config-open #jph-config,
+      #jph-panel:has(#jph-config-wrap[open]) #jph-config-tree,
+      #jph-panel:has(#jph-config-wrap[open]) #jph-config-view,
+      #jph-panel:has(#jph-config-wrap[open]) #jph-config { max-height:min(48vh, 520px); }
+      #jph-config { height:min(48vh, 520px); min-height:220px; font-family: Consolas, monospace; resize: vertical; }
       #jph-config-tree details { margin: 4px 0; }
       #jph-config-tree summary { cursor: pointer; }
       #jph-config-tree .json-children { margin-left: 10px; padding-left: 8px; border-left: 1px dashed #1f2937; }
@@ -461,6 +512,149 @@
     }
   }
 
+  function parseBuildNumberFromLink(link) {
+    try {
+      const url = new URL(link, location.origin);
+      const parts = url.pathname.split('/').filter(Boolean);
+      for (let i = parts.length - 1; i >= 0; i--) {
+        if (/^\d+$/.test(parts[i])) return Number(parts[i]);
+      }
+    } catch (e) {
+      // ignore malformed link
+    }
+    return null;
+  }
+
+  function parseBuildNumberFromTitle(title) {
+    const match = String(title || '').match(/#(\d+)/);
+    return match ? Number(match[1]) : null;
+  }
+
+  function parseResultFromFeedTitle(title) {
+    const lower = String(title || '').toLowerCase();
+    if (lower.includes('building') || lower.includes('in progress')) {
+      return { result: null, building: true };
+    }
+    if (lower.includes('stable') || lower.includes('success')) {
+      return { result: 'SUCCESS', building: false };
+    }
+    if (lower.includes('unstable')) {
+      return { result: 'UNSTABLE', building: false };
+    }
+    if (lower.includes('aborted')) {
+      return { result: 'ABORTED', building: false };
+    }
+    if (lower.includes('broken') || lower.includes('fail')) {
+      return { result: 'FAILURE', building: false };
+    }
+    return { result: null, building: false };
+  }
+
+  function feedText(node, selector) {
+    const el = node.querySelector(selector);
+    return el && el.textContent ? String(el.textContent).trim() : '';
+  }
+
+  function feedLink(node) {
+    const link = node.querySelector('link');
+    if (!link) return '';
+    return link.getAttribute('href') || String(link.textContent || '').trim();
+  }
+
+  function feedTimestamp(node) {
+    const raw = feedText(node, 'published') || feedText(node, 'updated') || feedText(node, 'pubDate');
+    if (!raw) return 0;
+    const ts = Date.parse(raw);
+    return Number.isFinite(ts) ? ts : 0;
+  }
+
+  async function fetchJenkinsCrumb(baseUrl) {
+    if (crumbCache) return crumbCache;
+    const resp = await fetch(normalizeUrl(baseUrl, '/crumbIssuer/api/json'), { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Failed to fetch Jenkins crumb');
+    const data = await resp.json();
+    crumbCache = {
+      field: data.crumbRequestField || 'Jenkins-Crumb',
+      value: data.crumb
+    };
+    return crumbCache;
+  }
+
+  function parseTimelineResult(event) {
+    const text = `${event.classname || ''} ${event.color || ''} ${event.title || ''}`.toLowerCase();
+    if (text.includes('anime') || text.includes('building')) {
+      return { result: null, building: true };
+    }
+    if (text.includes('event-blue') || text.includes('#4f6f90') || text.includes('success')) {
+      return { result: 'SUCCESS', building: false };
+    }
+    if (text.includes('event-yellow') || text.includes('unstable')) {
+      return { result: 'UNSTABLE', building: false };
+    }
+    if (text.includes('event-red') || text.includes('failure') || text.includes('failed')) {
+      return { result: 'FAILURE', building: false };
+    }
+    if (text.includes('event-grey') || text.includes('aborted')) {
+      return { result: 'ABORTED', building: false };
+    }
+    return { result: null, building: false };
+  }
+
+  function timelineEventToHistoryItem(event, baseUrl) {
+    const link = event.link ? normalizeUrl(baseUrl, event.link) : '';
+    let jobName = link ? parseJobFullNameFromLink(link) : null;
+    if (!jobName) {
+      const cleaned = String(event.title || '').replace(/\s*#\d+.*$/, '').replace(/\s*»\s*/g, '/').trim();
+      if (cleaned) jobName = cleaned;
+    }
+    const buildNumber = parseBuildNumberFromLink(link) || parseBuildNumberFromTitle(event.title);
+    if (!jobName || !buildNumber) return null;
+    const start = Date.parse(event.start || '');
+    const end = Date.parse(event.end || '');
+    const status = parseTimelineResult(event);
+    return {
+      id: buildHistoryId(jobName, buildNumber),
+      jobName,
+      jobShortName: jobName.split('/').pop(),
+      buildNumber,
+      url: link || normalizeUrl(baseUrl, `${buildJobPath(jobName)}/${buildNumber}/`),
+      building: status.building,
+      result: status.result,
+      timestamp: Number.isFinite(start) ? start : 0,
+      duration: Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : 0
+    };
+  }
+
+  async function fetchTimelineBuilds(baseUrl, dayIndex, retried) {
+    const crumb = await fetchJenkinsCrumb(baseUrl);
+    const headers = {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+    };
+    headers[crumb.field] = crumb.value;
+    const params = new URLSearchParams({
+      min: String(dayIndex * TIMELINE_DAY_MS),
+      max: String((dayIndex + 1) * TIMELINE_DAY_MS)
+    });
+    const resp = await fetch(normalizeUrl(baseUrl, '/view/all/timeline/data/'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers,
+      body: params.toString()
+    });
+    if (!resp.ok) {
+      if (resp.status === 403 && !retried) {
+        crumbCache = null;
+        return fetchTimelineBuilds(baseUrl, dayIndex, true);
+      }
+      throw new Error(`Failed to fetch timeline data: HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    return (data.events || [])
+      .map(event => timelineEventToHistoryItem(event, baseUrl))
+      .filter(Boolean)
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  }
+
   function setMenuLabel(link, label) {
     const labelEl = link.querySelector('.jenkins-menu__label, .menu-title, .title, span');
     if (labelEl) {
@@ -493,14 +687,14 @@
     if (!resp.ok) throw new Error('Failed to fetch RSS');
     const xml = await resp.text();
     const doc = new DOMParser().parseFromString(xml, 'application/xml');
-    const items = Array.from(doc.querySelectorAll('item'));
+    const items = Array.from(doc.querySelectorAll('entry, item'));
     const results = [];
     const seen = new Set();
     for (const item of items) {
-      const link = item.querySelector('link')?.textContent?.trim();
+      const link = feedLink(item);
       let fullName = link ? parseJobFullNameFromLink(link) : null;
       if (!fullName) {
-        const title = item.querySelector('title')?.textContent?.trim() || '';
+        const title = feedText(item, 'title');
         const cleaned = title.replace(/\s*#\d+.*$/, '').replace(/\s*»\s*/g, '/').trim();
         if (cleaned) fullName = cleaned;
       }
@@ -510,6 +704,45 @@
       if (results.length >= limit) break;
     }
     return results;
+  }
+
+  async function fetchRecentBuildsFromRss(baseUrl, limit) {
+    const url = normalizeUrl(baseUrl, '/rssAll');
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Failed to fetch RSS');
+    const xml = await resp.text();
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    const items = Array.from(doc.querySelectorAll('entry, item'));
+    const results = [];
+    const seen = new Set();
+    for (const item of items) {
+      const link = feedLink(item);
+      const title = feedText(item, 'title');
+      let jobName = link ? parseJobFullNameFromLink(link) : null;
+      if (!jobName) {
+        const cleaned = title.replace(/\s*#\d+.*$/, '').replace(/\s*»\s*/g, '/').trim();
+        if (cleaned) jobName = cleaned;
+      }
+      const buildNumber = parseBuildNumberFromLink(link) || parseBuildNumberFromTitle(title);
+      if (!jobName || !buildNumber) continue;
+      const id = buildHistoryId(jobName, buildNumber);
+      if (seen.has(id)) continue;
+      seen.add(id);
+
+      const status = parseResultFromFeedTitle(title);
+      results.push({
+        id,
+        jobName,
+        jobShortName: jobName.split('/').pop(),
+        buildNumber,
+        url: link || normalizeUrl(baseUrl, `${buildJobPath(jobName)}/${buildNumber}/`),
+        building: status.building,
+        result: status.result,
+        timestamp: feedTimestamp(item)
+      });
+      if (results.length >= limit) break;
+    }
+    return enrichBuildDetails(baseUrl, results);
   }
 
   function isLoggedIn() {
@@ -569,10 +802,52 @@
     return results;
   }
 
-  async function fetchJobBuilds(baseUrl, jobFullName, limit) {
+  function executableToHistoryItem(baseUrl, executable) {
+    if (!executable || !executable.number || !executable.url) return null;
+    const url = normalizeUrl(baseUrl, executable.url);
+    const jobFullName = parseJobFullNameFromLink(url);
+    if (!jobFullName) return null;
+    const timestamp = executable.timestamp || 0;
+    const duration = executable.duration || (timestamp ? Math.max(0, Date.now() - timestamp) : 0);
+    return {
+      id: buildHistoryId(jobFullName, executable.number),
+      jobName: jobFullName,
+      jobShortName: jobFullName.split('/').pop(),
+      buildNumber: executable.number,
+      url,
+      building: executable.building !== false,
+      result: executable.result || null,
+      timestamp,
+      duration,
+      userName: pickUserName(executable.actions || [])
+    };
+  }
+
+  async function fetchCurrentBuildingBuilds(baseUrl) {
+    const api = normalizeUrl(baseUrl, '/computer/api/json?tree=computer[executors[currentExecutable[number,url,building,result,timestamp,duration,actions[causes[userId,userName]]]],oneOffExecutors[currentExecutable[number,url,building,result,timestamp,duration,actions[causes[userId,userName]]]]]');
+    const resp = await fetch(api, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error('Failed to fetch current executors');
+    const data = await resp.json();
+    const executables = [];
+    (data.computer || []).forEach(node => {
+      (node.executors || []).forEach(executor => {
+        if (executor && executor.currentExecutable) executables.push(executor.currentExecutable);
+      });
+      (node.oneOffExecutors || []).forEach(executor => {
+        if (executor && executor.currentExecutable) executables.push(executor.currentExecutable);
+      });
+    });
+    return executables
+      .map(executable => executableToHistoryItem(baseUrl, executable))
+      .filter(Boolean);
+  }
+
+  async function fetchJobBuildsRange(baseUrl, jobFullName, offset, limit) {
     const cap = Number.isFinite(limit) ? limit : 30;
+    const start = Number.isFinite(offset) ? Math.max(0, offset) : 0;
+    const end = start + cap;
     const path = buildJobPath(jobFullName);
-    const api = normalizeUrl(baseUrl, `${path}/api/json?tree=builds[number,url,building,result,timestamp,duration,actions[causes[userId,userName]]]{0,${cap}}`);
+    const api = normalizeUrl(baseUrl, `${path}/api/json?tree=builds[number,url,building,result,timestamp,duration,actions[causes[userId,userName]]]{${start},${end}}`);
     const resp = await fetch(api, { credentials: 'same-origin' });
     if (!resp.ok) throw new Error(`Failed to fetch builds for ${jobFullName}`);
     const data = await resp.json();
@@ -589,6 +864,10 @@
       duration: b.duration || 0,
       userName: pickUserName(b.actions || [])
     }));
+  }
+
+  async function fetchJobBuilds(baseUrl, jobFullName, limit) {
+    return fetchJobBuildsRange(baseUrl, jobFullName, 0, limit);
   }
 
   async function fetchBuildStatus(baseUrl, jobFullName, buildNumber) {
@@ -608,6 +887,37 @@
       duration: data.duration || 0,
       userName: pickUserName(data.actions || [])
     };
+  }
+
+  async function enrichBuildDetails(baseUrl, items) {
+    const source = items || [];
+    const enriched = new Array(source.length);
+    const concurrency = 6;
+    let nextIndex = 0;
+
+    async function worker() {
+      while (nextIndex < source.length) {
+        const index = nextIndex++;
+        const item = source[index];
+        if (!item || !item.jobName || !item.buildNumber) {
+          enriched[index] = item;
+          continue;
+        }
+        try {
+          const detail = await fetchBuildStatus(baseUrl, item.jobName, item.buildNumber);
+          enriched[index] = { ...item, ...detail, url: item.url || detail.url };
+        } catch (e) {
+          enriched[index] = item;
+        }
+      }
+    }
+
+    const workers = [];
+    for (let i = 0; i < Math.min(concurrency, source.length); i++) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+    return enriched.filter(Boolean);
   }
 
   function renderUI(cfg) {
@@ -634,14 +944,14 @@
         <div class="tabs">
           <div class="tab active" data-tab="all">All</div>
           <div class="tab" data-tab="byjob">By Job</div>
-          <div class="tab-help" title="只显示最近的10个job">?</div>
+          <div class="tab-help" title="All 显示全局最新构建；By Job 按当前历史分组">?</div>
         </div>
         <div class="row" id="jph-filter-row" style="display:none;">
           <input id="jph-filter" placeholder="Filter jobs..." />
         </div>
         <div id="jph-history-all" class="history"></div>
         <div id="jph-history-byjob" class="history" style="display:none;"></div>
-        <details style="margin-top:8px;">
+        <details id="jph-config-wrap">
           <summary class="muted">Config (JSON)</summary>
           <div class="row" style="margin-bottom:6px;">
             <button class="secondary" id="jph-view-tree">Tree</button>
@@ -663,10 +973,10 @@
     document.body.appendChild(panel);
 
     let visible = loadUI().visible;
-    panel.style.display = visible ? 'block' : 'none';
+    panel.style.display = visible ? 'flex' : 'none';
     toggle.addEventListener('click', () => {
       visible = !visible;
-      panel.style.display = visible ? 'block' : 'none';
+      panel.style.display = visible ? 'flex' : 'none';
       saveUI({ visible });
     });
 
@@ -758,6 +1068,250 @@
     setLogsVisible(!!cfg.debug);
     let lastResult = '';
     let history = loadHistory();
+    let refreshSeq = 0;
+    let allLoadSeq = 0;
+    let allTimelineState = {
+      loading: false,
+      nextDay: null,
+      exhausted: false,
+      message: ''
+    };
+    let allJobPagerState = {
+      initialized: false,
+      jobs: [],
+      offsets: {},
+      exhausted: {},
+      nextIndex: 0
+    };
+
+    function resetAllTimelineState() {
+      allLoadSeq += 1;
+      allTimelineState = {
+        loading: false,
+        nextDay: null,
+        exhausted: false,
+        message: ''
+      };
+      allJobPagerState = {
+        initialized: false,
+        jobs: [],
+        offsets: {},
+        exhausted: {},
+        nextIndex: 0
+      };
+    }
+
+    function getOldestHistoryTimestamp() {
+      let oldest = Infinity;
+      (history || []).forEach(item => {
+        if (item && item.timestamp) oldest = Math.min(oldest, item.timestamp);
+      });
+      return Number.isFinite(oldest) ? oldest : Date.now();
+    }
+
+    function initAllTimelineState() {
+      if (allTimelineState.nextDay !== null) return;
+      allTimelineState.nextDay = Math.floor(getOldestHistoryTimestamp() / TIMELINE_DAY_MS);
+    }
+
+    async function fetchMoreTimelineHistory(baseUrl) {
+      if (allTimelineState.exhausted) return [];
+      initAllTimelineState();
+      const incoming = [];
+      const seen = new Set((history || []).map(item => item && item.id).filter(Boolean));
+      let scannedDays = 0;
+      while (incoming.length < HISTORY_PAGE_SIZE && scannedDays < TIMELINE_DAYS_PER_LOAD) {
+        const day = allTimelineState.nextDay;
+        allTimelineState.nextDay -= 1;
+        scannedDays += 1;
+        const builds = await fetchTimelineBuilds(baseUrl, day);
+        builds.forEach(item => {
+          if (!item || !item.id || seen.has(item.id)) return;
+          seen.add(item.id);
+          incoming.push(item);
+        });
+      }
+      allTimelineState.message = incoming.length
+        ? ''
+        : `No builds found in previous ${scannedDays} day(s). Scroll again to search earlier.`;
+      if (!incoming.length) allTimelineState.exhausted = true;
+      return incoming;
+    }
+
+    function getHistoryJobCounts() {
+      const counts = {};
+      (history || []).forEach(item => {
+        if (!item || !item.jobName) return;
+        counts[item.jobName] = (counts[item.jobName] || 0) + 1;
+      });
+      return counts;
+    }
+
+    async function initAllJobPager(baseUrl) {
+      if (allJobPagerState.initialized) return;
+      const counts = getHistoryJobCounts();
+      const latestByJob = new Map();
+      (history || []).forEach(item => {
+        if (!item || !item.jobName) return;
+        const prev = latestByJob.get(item.jobName) || 0;
+        latestByJob.set(item.jobName, Math.max(prev, item.timestamp || 0));
+      });
+      const jobs = Array.from(latestByJob.keys())
+        .map(name => ({ name, ts: latestByJob.get(name) || 0 }))
+        .sort((a, b) => b.ts - a.ts);
+      try {
+        const allJobs = await fetchAllJobs(baseUrl);
+        allJobs
+          .map(j => ({ name: j.fullName || j.name, ts: (j.lastBuild && j.lastBuild.timestamp) || 0 }))
+          .sort((a, b) => b.ts - a.ts)
+          .forEach(job => {
+            if (job.name && !latestByJob.has(job.name)) jobs.push(job);
+          });
+      } catch (e) {
+        if (cfg.debug) {
+          panel.querySelector('#jph-logs').textContent += `Debug: job pager list error=${e.message || e}\n`;
+        }
+      }
+      allJobPagerState.jobs = jobs.map(j => j.name).filter(Boolean);
+      allJobPagerState.offsets = {};
+      Object.keys(counts).forEach(jobName => {
+        allJobPagerState.offsets[jobName] = counts[jobName];
+      });
+      allJobPagerState.exhausted = {};
+      allJobPagerState.nextIndex = 0;
+      allJobPagerState.initialized = true;
+    }
+
+    async function fetchMoreJobHistory(baseUrl) {
+      await initAllJobPager(baseUrl);
+      const jobs = allJobPagerState.jobs;
+      const incoming = [];
+      const seen = new Set((history || []).map(item => item && item.id).filter(Boolean));
+      if (!jobs.length) return incoming;
+      const jobsPerLoad = Math.min(jobs.length, Math.max(RECENT_JOB_LIMIT, 1));
+      let scannedJobs = 0;
+      let attempts = 0;
+      while (incoming.length < HISTORY_PAGE_SIZE && scannedJobs < jobsPerLoad && attempts < jobs.length) {
+        const index = allJobPagerState.nextIndex % jobs.length;
+        allJobPagerState.nextIndex = (allJobPagerState.nextIndex + 1) % jobs.length;
+        attempts += 1;
+        const jobName = jobs[index];
+        if (!jobName || allJobPagerState.exhausted[jobName]) continue;
+        scannedJobs += 1;
+        const offset = allJobPagerState.offsets[jobName] || 0;
+        const builds = await fetchJobBuildsRange(baseUrl, jobName, offset, HISTORY_PAGE_SIZE);
+        allJobPagerState.offsets[jobName] = offset + builds.length;
+        if (builds.length < HISTORY_PAGE_SIZE) {
+          allJobPagerState.exhausted[jobName] = true;
+        }
+        builds.forEach(item => {
+          if (!item || !item.id || seen.has(item.id)) return;
+          seen.add(item.id);
+          incoming.push(item);
+        });
+      }
+      allTimelineState.message = incoming.length
+        ? ''
+        : 'No more loaded jobs returned older builds.';
+      return incoming.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    }
+
+    async function loadMoreAllHistory() {
+      if (allTimelineState.loading || !isLoggedIn()) return;
+      const loadSeq = ++allLoadSeq;
+      allTimelineState.loading = true;
+      allTimelineState.message = '';
+      const loadingFooter = panel.querySelector('#jph-history-all .history-more');
+      if (loadingFooter) loadingFooter.textContent = 'Loading more...';
+      const baseUrl = location.origin;
+      try {
+        let incoming = [];
+        let timelineError = null;
+        try {
+          incoming = await fetchMoreTimelineHistory(baseUrl);
+        } catch (e) {
+          timelineError = e;
+          crumbCache = null;
+          if (cfg.debug) {
+            panel.querySelector('#jph-logs').textContent += `Debug: timeline error=${e.message || e}\n`;
+            panel.querySelector('#jph-logs-wrap').open = true;
+          }
+        }
+        if (loadSeq !== allLoadSeq) return;
+        if (!incoming.length) {
+          incoming = await fetchMoreJobHistory(baseUrl);
+        }
+        if (loadSeq !== allLoadSeq) return;
+        if (incoming.length) {
+          history = mergeHistory(history, incoming);
+        } else if (timelineError && !allTimelineState.message) {
+          allTimelineState.message = `Timeline unavailable: ${timelineError.message || timelineError}`;
+        }
+      } catch (e) {
+        allTimelineState.message = `Load more failed: ${e.message || e}`;
+        if (cfg.debug) {
+          panel.querySelector('#jph-logs').textContent += `Debug: load more error=${e.message || e}\n`;
+          panel.querySelector('#jph-logs-wrap').open = true;
+        }
+      } finally {
+        if (loadSeq !== allLoadSeq) return;
+        const root = panel.querySelector('#jph-history-all');
+        const scrollTop = root ? root.scrollTop : 0;
+        allTimelineState.loading = false;
+        renderHistoryLists();
+        const nextRoot = panel.querySelector('#jph-history-all');
+        if (nextRoot) nextRoot.scrollTop = scrollTop;
+      }
+    }
+
+    function maybeLoadMoreAllHistory() {
+      const root = panel.querySelector('#jph-history-all');
+      if (!root || root.style.display === 'none') return;
+      if (allTimelineState.loading) return;
+      if (root.scrollHeight - root.scrollTop - root.clientHeight <= 48) {
+        loadMoreAllHistory();
+      }
+    }
+
+    function createHistoryActionButton(action, label, item) {
+      const button = el('button', { text: label });
+      button.dataset.action = action;
+      button.dataset.job = item.jobName || '';
+      if (action === 'open-console') {
+        button.dataset.build = String(item.buildNumber || '');
+      }
+      return button;
+    }
+
+    function createHistoryLine(item, titleText) {
+      const badgeCls = statusClass(item.result, item.building);
+      const line = el('div', { class: 'history-item' });
+      line.dataset.id = item.id || '';
+
+      const title = el('div', { class: 'history-title' });
+      title.appendChild(document.createTextNode(titleText));
+      title.appendChild(el('span', {
+        class: `badge ${badgeCls}`,
+        text: item.building ? 'BUILDING' : (item.result || 'UNKNOWN')
+      }));
+
+      const meta = el('div', { class: 'history-meta' });
+      [
+        formatTime(item.timestamp),
+        `duration: ${formatDuration(item.duration)}`,
+        item.userName || '-'
+      ].forEach(text => meta.appendChild(el('span', { text })));
+
+      const actions = el('div', { class: 'history-actions' });
+      actions.appendChild(createHistoryActionButton('copy-job', 'Copy Job', item));
+      actions.appendChild(createHistoryActionButton('open-job', 'Open Job', item));
+      actions.appendChild(createHistoryActionButton('open-console', 'Console', item));
+
+      line.appendChild(title);
+      line.appendChild(meta);
+      line.appendChild(actions);
+      return line;
+    }
 
     function renderHistoryLists() {
       const allRoot = panel.querySelector('#jph-history-all');
@@ -768,29 +1322,17 @@
       saveHistory(history);
 
       if (!sorted.length) {
-        allRoot.innerHTML = `<div class="muted" style="padding:8px;">No history.</div>`;
+        allRoot.replaceChildren(el('div', { class: 'muted', style: 'padding:8px;', text: 'No history.' }));
       } else {
         allRoot.innerHTML = '';
         sorted.forEach(item => {
-          const badgeCls = statusClass(item.result, item.building);
-          const title = `${item.jobName} #${item.buildNumber}`;
-          const line = el('div', { class: 'history-item', 'data-id': item.id });
-          line.innerHTML = `
-            <div class="history-title">${title}<span class="badge ${badgeCls}">${item.building ? 'BUILDING' : (item.result || 'UNKNOWN')}</span></div>
-            <div class="history-meta">
-              <span>${formatTime(item.timestamp)}</span>
-              <span>duration: ${formatDuration(item.duration)}</span>
-              <span>${item.userName || '-'}</span>
-            </div>
-            <div class="history-actions">
-              <button data-action="copy-job" data-job="${item.jobName}">Copy Job</button>
-              <button data-action="open-job" data-job="${item.jobName}">Open Job</button>
-              <button data-action="open-console" data-job="${item.jobName}" data-build="${item.buildNumber}">Console</button>
-            </div>
-          `;
-          allRoot.appendChild(line);
+          allRoot.appendChild(createHistoryLine(item, `${item.jobName} #${item.buildNumber}`));
         });
       }
+      const moreText = allTimelineState.loading
+        ? 'Loading more...'
+        : (allTimelineState.message || 'Scroll or click for more');
+      allRoot.appendChild(el('div', { class: 'history-more', text: moreText }));
 
       byJobRoot.innerHTML = '';
       const groups = new Map();
@@ -805,28 +1347,13 @@
         }
         const items = groups.get(jobName) || [];
         const section = el('div', { class: 'job' });
-        const header = el('div', { class: 'history-title', html: `${jobName}` });
+        const header = el('div', { class: 'history-title', text: `${jobName}` });
         section.appendChild(header);
         if (!items.length) {
-          section.appendChild(el('div', { class: 'muted', html: 'No history.' }));
+          section.appendChild(el('div', { class: 'muted', text: 'No history.' }));
         } else {
           items.forEach(item => {
-            const badgeCls = statusClass(item.result, item.building);
-            const line = el('div', { class: 'history-item', 'data-id': item.id });
-            line.innerHTML = `
-              <div class="history-title">#${item.buildNumber}<span class="badge ${badgeCls}">${item.building ? 'BUILDING' : (item.result || 'UNKNOWN')}</span></div>
-              <div class="history-meta">
-                <span>${formatTime(item.timestamp)}</span>
-                <span>duration: ${formatDuration(item.duration)}</span>
-                <span>${item.userName || '-'}</span>
-              </div>
-              <div class="history-actions">
-                <button data-action="copy-job" data-job="${item.jobName}">Copy Job</button>
-                <button data-action="open-job" data-job="${item.jobName}">Open Job</button>
-                <button data-action="open-console" data-job="${item.jobName}" data-build="${item.buildNumber}">Console</button>
-              </div>
-            `;
-            section.appendChild(line);
+            section.appendChild(createHistoryLine(item, `#${item.buildNumber}`));
           });
         }
         byJobRoot.appendChild(section);
@@ -931,24 +1458,44 @@
         }
         return;
       }
+      const seq = ++refreshSeq;
       const baseUrl = location.origin;
       const results = [];
       let recentJobs = [];
+      if (force) resetAllTimelineState();
       try {
-        recentJobs = await fetchRecentJobsFromRss(baseUrl, 10);
+        results.push(...await fetchRecentBuildsFromRss(baseUrl, HISTORY_PAGE_SIZE));
       } catch (e) {
         if (cfg.debug) {
-          panel.querySelector('#jph-logs').textContent += `Debug: rss error=${e.message || e}\n`;
+          panel.querySelector('#jph-logs').textContent += `Debug: rss builds error=${e.message || e}\n`;
         }
         // ignore
       }
-      if (!recentJobs.length) {
+      try {
+        results.push(...await fetchCurrentBuildingBuilds(baseUrl));
+      } catch (e) {
+        if (cfg.debug) {
+          panel.querySelector('#jph-logs').textContent += `Debug: building builds error=${e.message || e}\n`;
+        }
+        // ignore
+      }
+      if (!results.length) {
+        try {
+          recentJobs = await fetchRecentJobsFromRss(baseUrl, RECENT_JOB_LIMIT);
+        } catch (e) {
+          if (cfg.debug) {
+            panel.querySelector('#jph-logs').textContent += `Debug: rss jobs error=${e.message || e}\n`;
+          }
+          // ignore
+        }
+      }
+      if (!results.length && !recentJobs.length) {
         try {
           const jobs = await fetchAllJobs(baseUrl);
           recentJobs = jobs
             .map(j => ({ name: j.fullName || j.name, ts: (j.lastBuild && j.lastBuild.timestamp) || 0 }))
             .sort((a, b) => b.ts - a.ts)
-            .slice(0, 10)
+            .slice(0, RECENT_JOB_LIMIT)
             .map(j => j.name);
         } catch (e) {
           if (cfg.debug) {
@@ -957,23 +1504,27 @@
           // ignore
         }
       }
-      for (const jobName of recentJobs) {
-        try {
-          const builds = await fetchJobBuilds(baseUrl, jobName, 3);
-          results.push(...builds);
-        } catch (e) {
-          if (cfg.debug) {
-            panel.querySelector('#jph-logs').textContent += `Debug: builds error ${jobName}=${e.message || e}\n`;
+      if (!results.length) {
+        for (const jobName of recentJobs) {
+          try {
+            const builds = await fetchJobBuilds(baseUrl, jobName, HISTORY_PAGE_SIZE);
+            results.push(...builds);
+          } catch (e) {
+            if (cfg.debug) {
+              panel.querySelector('#jph-logs').textContent += `Debug: builds error ${jobName}=${e.message || e}\n`;
+            }
+            // ignore per-job errors
           }
-          // ignore per-job errors
         }
       }
+      if (seq !== refreshSeq) return;
       if (force && results.length) {
         history = sortTrimHistory(results);
       } else {
         history = mergeHistory(history, results);
       }
       renderHistoryLists();
+      setTimeout(maybeLoadMoreAllHistory, 0);
       if (cfg.debug) {
         panel.querySelector('#jph-logs').textContent += `Debug: refresh jobs=${recentJobs.length} builds=${results.length} force=${!!force}\n`;
         panel.querySelector('#jph-logs-wrap').open = true;
@@ -1127,11 +1678,20 @@
     panel.querySelector('#jph-clear').addEventListener('click', () => {
       history = [];
       saveHistory(history);
+      resetAllTimelineState();
       renderHistoryLists();
     });
 
     treeBtn.addEventListener('click', () => setConfigViewMode('tree'));
     codeBtn.addEventListener('click', () => setConfigViewMode('code'));
+    const configWrap = panel.querySelector('#jph-config-wrap');
+    if (configWrap) {
+      panel.classList.toggle('jph-config-open', configWrap.open);
+      configWrap.addEventListener('toggle', () => {
+        panel.classList.toggle('jph-config-open', configWrap.open);
+        if (configWrap.open) configWrap.scrollIntoView({ block: 'nearest' });
+      });
+    }
 
     function handleActionClick(e) {
       const btn = e.target.closest('button[data-action]');
@@ -1158,9 +1718,14 @@
 
     panel.querySelector('#jph-history-all').addEventListener('click', e => {
       if (handleActionClick(e)) return;
+      if (e.target.closest('.history-more')) {
+        loadMoreAllHistory();
+        return;
+      }
       const el = e.target.closest('.history-item');
       if (el) handleHistoryClick(el);
     });
+    panel.querySelector('#jph-history-all').addEventListener('scroll', maybeLoadMoreAllHistory);
     panel.querySelector('#jph-history-byjob').addEventListener('click', e => {
       if (handleActionClick(e)) return;
       const el = e.target.closest('.history-item');
@@ -1175,6 +1740,7 @@
         panel.querySelector('#jph-history-all').style.display = target === 'all' ? 'block' : 'none';
         panel.querySelector('#jph-history-byjob').style.display = target === 'byjob' ? 'block' : 'none';
         panel.querySelector('#jph-filter-row').style.display = target === 'byjob' ? 'flex' : 'none';
+        if (target === 'all') setTimeout(maybeLoadMoreAllHistory, 0);
       });
     });
 
@@ -1220,9 +1786,13 @@
     const header = document.querySelector('#header') || document.body;
     window.__jph_user_observer = new MutationObserver(() => checkLoginOnce());
     window.__jph_user_observer.observe(header, { childList: true, subtree: true, characterData: true });
-    document.addEventListener('visibilitychange', () => {
+    if (window.__jph_visibility_handler) {
+      document.removeEventListener('visibilitychange', window.__jph_visibility_handler);
+    }
+    window.__jph_visibility_handler = () => {
       if (!document.hidden) checkLoginOnce();
-    });
+    };
+    document.addEventListener('visibilitychange', window.__jph_visibility_handler);
     setupBuildHistoryMenu();
   }
 
