@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jenkins Pack Helper
 // @namespace    jenkins-pack-helper
-// @version      0.1.2
+// @version      0.1.3
 // @description  Build Jenkins jobs and extract success messages.
 // @match        http://192.169.2.50:9081/*
 // @updateURL    https://raw.githubusercontent.com/lyd123qw2008/jenkins-pack-helper/main/jenkins-pack-helper.user.js
@@ -18,7 +18,7 @@
     Node.prototype.querySelector = function () { return null; };
   }
 
-  const SCRIPT_VERSION = '2026-07-03-3';
+  const SCRIPT_VERSION = '2026-07-03-4';
   const STORAGE_KEY = 'jph_config_v1';
   const HISTORY_KEY = 'jph_history_v1';
   const UI_KEY = 'jph_ui_v1';
@@ -237,7 +237,7 @@
       #jph-panel .history-more:hover { background:#0f172a; color:#cbd5e1; }
       #jph-panel .byjob-head { padding:8px; border-bottom:1px solid #111827; background:#0b1224; }
       #jph-panel .byjob-name { font-size:12px; margin-bottom:3px; word-break:break-all; }
-      #jph-panel .job-picker { max-height:150px; overflow:auto; border-bottom:1px solid #111827; background:#0b1224; }
+      #jph-panel .job-suggestions { max-height:min(32vh, 220px); overflow:auto; border-bottom:1px solid #111827; background:#0b1224; }
       #jph-panel .job-option { padding:6px 8px; border-bottom:1px solid #111827; cursor:pointer; font-size:11px; word-break:break-all; }
       #jph-panel .job-option:last-child { border-bottom:0; }
       #jph-panel .job-option:hover { background:#0f172a; }
@@ -954,7 +954,7 @@
           <div class="tab-help" title="All 显示全局最新构建；By Job 查询选中 job 自己的构建历史">?</div>
         </div>
         <div class="row" id="jph-filter-row" style="display:none;">
-          <input id="jph-filter" placeholder="Filter jobs..." />
+          <input id="jph-filter" placeholder="Search job to switch..." />
         </div>
         <div id="jph-history-all" class="history"></div>
         <div id="jph-history-byjob" class="history" style="display:none;"></div>
@@ -1420,6 +1420,8 @@
         byJobSeq += 1;
         byJobState.selectedJob = jobName;
       }
+      const filterInput = panel.querySelector('#jph-filter');
+      if (filterInput) filterInput.value = '';
       const entry = getByJobEntry(jobName);
       renderHistoryLists();
       if (!entry.items.length && !entry.loading) loadMoreByJobHistory(true);
@@ -1497,10 +1499,10 @@
       const normalizedFilter = filterValue.toLowerCase();
       const matchedJobs = (byJobState.jobList || [])
         .filter(job => !normalizedFilter || job.name.toLowerCase().includes(normalizedFilter));
-      const pickerLimit = normalizedFilter ? 50 : 8;
-      const shouldShowPicker = byJobState.jobListLoading || byJobState.jobList.length || normalizedFilter;
+      const pickerLimit = 50;
+      const shouldShowPicker = !!normalizedFilter;
       if (shouldShowPicker) {
-        const picker = el('div', { class: 'job-picker' });
+        const picker = el('div', { class: 'job-suggestions' });
         if (byJobState.jobListLoading) {
           picker.appendChild(el('div', { class: 'muted', style: 'padding:8px;', text: 'Loading jobs...' }));
         } else if (!matchedJobs.length) {
@@ -1987,6 +1989,16 @@
       if (currentTab === 'byjob' && !byJobState.jobListLoaded) {
         if (byJobFilterTimer) clearTimeout(byJobFilterTimer);
         byJobFilterTimer = setTimeout(() => ensureByJobList(), 300);
+      }
+    });
+    panel.querySelector('#jph-filter').addEventListener('keydown', e => {
+      if (e.key !== 'Enter' || currentTab !== 'byjob') return;
+      const value = (e.target.value || '').trim().toLowerCase();
+      if (!value) return;
+      const first = (byJobState.jobList || []).find(job => job.name.toLowerCase().includes(value));
+      if (first) {
+        e.preventDefault();
+        selectByJob(first.name);
       }
     });
 
